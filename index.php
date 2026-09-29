@@ -1,150 +1,7 @@
-<?php
-$servername = "localhost";
-$username = "root";
-$password = "123456";
-$dbname = "user"; 
-
-$conn = new mysqli($servername, $username, $password, $dbname);
-if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
-}
-
-$conn->set_charset("utf8mb4");
-$is_logged_in = false;
-$user_info = null;
-
-// 用 cookie 自动登录（GET 和 POST 都生效）
-if (!empty($_COOKIE['login_cookie'])) {
-    $token = $_COOKIE['login_cookie'];
-    $stmt = $conn->prepare("SELECT `uid` FROM `cookie` WHERE `cookie` = ?");
-    if ($stmt) {
-        $stmt->bind_param("s", $token);
-        $stmt->execute();
-        $res = $stmt->get_result();
-        if ($c = $res->fetch_assoc()) {
-            $uid = $c['uid'];
-            $stmt->close();
-
-            $stmt = $conn->prepare("SELECT * FROM `user` WHERE `uid` = ?");
-            if ($stmt) {
-                $stmt->bind_param("i", $uid);
-                $stmt->execute();
-                $res = $stmt->get_result();
-                if ($row = $res->fetch_assoc()) {
-                    $is_logged_in = true;
-                    $user_info = $row;
-                }
-                $stmt->close();
-            }
-        } else {
-            $stmt->close();
-        }
-    }
-}
-
-if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
-    if (isset($_POST['action']) && $_POST['action'] === 'login') {
-        $name = $_POST['name'] ?? '';
-        $UserPassword = $_POST['password'] ?? '';
-        if (!empty($name) && !empty($UserPassword)) {
-            $sql = "SELECT * FROM `user` WHERE `name` = ?";
-            $stmt = $conn->prepare($sql);
-            if ($stmt) {
-                $stmt->bind_param("s", $name);
-                $stmt->execute();
-                $result = $stmt->get_result();
-                
-                if ($row = $result->fetch_assoc()) {
-                    if ($row['password'] == $UserPassword) {
-                      $is_logged_in = true;
-                      $user_info = $row;
-
-                      $token = bin2hex(random_bytes(32));
-                      $stmt2 = $conn->prepare("INSERT INTO `cookie` (`cookie`, `uid`) VALUES (?, ?)");
-                      if ($stmt2) {
-                          $stmt2->bind_param("si", $token, $row['uid']);
-                          $stmt2->execute();
-                          $stmt2->close();
-                          setcookie("login_cookie", $token, time() + 86400 * 30, "/");
-                      }
-                    }
-                    else {
-                      echo "用户名或密码错误";
-                    }
-                } else {
-                    echo "用户不存在";
-                } $stmt->close();
-            } else {
-                echo "SQL 准备失败: " . $conn->error;
-            }
-        } else {
-            echo "请输入用户名和密码";
-        }
-    } else if (isset($_POST['action']) && $_POST['action'] === 'reslogin') {
-        $name = $_POST['name'] ?? '';
-        $UserPassword = $_POST['password'] ?? '';
-        $UserPassword2 = $_POST['passwordag'] ?? '';
-        if (!empty($name) && !empty($UserPassword) && !empty($UserPassword2)) {
-              if ($UserPassword == $UserPassword2) {
-
-            $result = $conn->query("SELECT COUNT(*) AS total FROM `user`");
-            $row1 = $result->fetch_assoc();
-              $sql = "INSERT INTO `user` (`name`, `calling`, `password`, `alc`) VALUES (?, 'none', ?, '0');";
-              $stmt1 = $conn->prepare($sql);
-              if ($stmt1) {
-                  $stmt1->bind_param("ss", $name, $UserPassword);
-                  if ($stmt1->execute()) {
-                      echo "注册成功";
-                  } else {
-                      echo "注册失败: " . $stmt1->error;
-                  }
-                  $stmt1->close();
-              } else {
-                  echo "SQL 准备失败: " . $conn->error;
-              }
-            } else {
-              echo "两次密码不一致";
-            }
-            
-        } else {
-            echo "请输入用户名和密码";
-        }
-    } else if (isset($_POST['action']) && $_POST['action'] === 'upload') {
-        // 只有权限为 1 的登录用户才能上传
-        if ($is_logged_in && $user_info['alc'] == 1) {
-            $uid     = intval($_POST['uid'] ?? 0);
-            $field   = $_POST['field'] ?? '';
-            $content = $_POST['content'] ?? '';
-            $allowed = ['A','B','C','D','E','F','G','H','I','J','K'];
-
-            if ($uid > 0 && in_array($field, $allowed, true)) {
-                $sql = "UPDATE `cook` SET `$field` = ? WHERE `uid` = ?";
-                $stmt = $conn->prepare($sql);
-                if ($stmt) {
-                    $stmt->bind_param("si", $content, $uid);
-                    if ($stmt->execute()) {
-                        echo "上传成功";
-                    } else {
-                        echo "上传失败: " . $stmt->error;
-                    }
-                    $stmt->close();
-                } else {
-                    echo "SQL 准备失败: " . $conn->error;
-                }
-            } else {
-                echo "参数错误";
-            }
-        } else {
-            echo "无权限上传";
-        }
-    }
-}
-?>
-
 <!DOCTYPE html>
 <html>
 <head>
-    <title>登录示例</title>
+    <title>欢迎</title>
     <meta charset="utf-8"/>
     <!-- ★ 不再引用任何外部 CDN -->
     <style>
@@ -163,6 +20,12 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             padding: 20px;
             border: 1px solid #ccc;
             margin-top: 20px;
+        }
+        .div-h {
+            position: relative;
+            padding: 0;
+            border: 0;
+            margin-top: 0;
         }
         .hidden { display: none; }
         .visible { display: block; }
@@ -238,29 +101,194 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     </style>
 </head>
 <body>
+  <div class='div' style="width:50%; left: 25%">
     <h1>欢迎！</h1>
 
     <!-- 登录表单 -->
     <form method="POST" id="l">
         <input type="hidden" name="action" value="login">
         <label>用户名: <input type="text" name="name" required></label><br>
-        <label>密&emsp;码: <input type="text" name="password" required></label><br><br>
+        <label>密&emsp;码: <input type="password" name="password" required></label><br><br>
         &emsp;&emsp;&emsp;&ensp;<button type="submit">登录</button>&emsp;<button type="button" onclick="ToL();">转换到注册页</button>
     </form>
     <form method="POST" id="r" style="display: none">
         <input type="hidden" name="action" value="reslogin">
         <label>用户名: <input type="text" name="name" required></label><br>
-        <label>密&emsp;码: <input type="text" name="password" required></label><br>
-        <label>确&emsp;认: <input type="text" name="passwordag" required></label><br><br>
+        <label>密&emsp;码: <input type="password" name="password" required></label><br>
+        <label>确&emsp;认: <input type="password" name="passwordag" required></label><br><br>
         &emsp;&emsp;&emsp;&ensp;<button type="submit">注册</button>&emsp;<button type="button" onclick="ToR();">转换到登录页</button>
-    </form>
+    </form><br>
+
+    <?php
+$servername = "localhost";
+$username = "root";
+$password = "123456";
+$dbname = "user"; 
+
+$conn = new mysqli($servername, $username, $password, $dbname);
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+
+$conn->set_charset("utf8mb4");
+$is_logged_in = false;
+$user_info = null;
+
+// 用 cookie 自动登录（GET 和 POST 都生效）
+if (!empty($_COOKIE['login_cookie'])) {
+    $token = $_COOKIE['login_cookie'];
+    $stmt = $conn->prepare("SELECT `uid` FROM `cookie` WHERE `cookie` = ?");
+    if ($stmt) {
+        $stmt->bind_param("s", $token);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        if ($c = $res->fetch_assoc()) {
+            $uid = $c['uid'];
+            $stmt->close();
+
+            $stmt = $conn->prepare("SELECT * FROM `user` WHERE `uid` = ?");
+            if ($stmt) {
+                $stmt->bind_param("i", $uid);
+                $stmt->execute();
+                $res = $stmt->get_result();
+                if ($row = $res->fetch_assoc()) {
+                    $is_logged_in = true;
+                    $user_info = $row;
+                }
+                $stmt->close();
+            }
+        } else {
+            $stmt->close();
+        }
+    }
+}
+
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
+    if (isset($_POST['action']) && $_POST['action'] === 'login') {
+        $name = $_POST['name'] ?? '';
+        $UserPassword = $_POST['password'] ?? '';
+        if (!empty($name) && !empty($UserPassword)) {
+            $sql = "SELECT * FROM `user` WHERE `name` = ?";
+            $stmt = $conn->prepare($sql);
+            if ($stmt) {
+                $stmt->bind_param("s", $name);
+                $stmt->execute();
+                $result = $stmt->get_result();
+                
+                if ($row = $result->fetch_assoc()) {
+                    $login_ok = false;
+
+                    // 仅使用哈希验证（明文密码一律视为错误）
+                    if (password_verify($UserPassword, $row['password'])) {
+                        $login_ok = true;
+
+                        // 若哈希算法/成本已过时，自动升级为当前默认算法
+                        if (password_needs_rehash($row['password'], PASSWORD_DEFAULT)) {
+                            $newHash = password_hash($UserPassword, PASSWORD_DEFAULT);
+                            $upd = $conn->prepare("UPDATE `user` SET `password` = ? WHERE `uid` = ?");
+                            if ($upd) {
+                                $upd->bind_param("si", $newHash, $row['uid']);
+                                $upd->execute();
+                                $upd->close();
+                            }
+                        }
+                    }
+
+                    if ($login_ok) {
+                        $is_logged_in = true;
+                        $user_info = $row;
+
+                        $token = bin2hex(random_bytes(32));
+                        $stmt2 = $conn->prepare("INSERT INTO `cookie` (`cookie`, `uid`) VALUES (?, ?)");
+                        if ($stmt2) {
+                            $stmt2->bind_param("si", $token, $row['uid']);
+                            $stmt2->execute();
+                            $stmt2->close();
+                            setcookie("login_cookie", $token, time() + 86400 * 30, "/");
+                        }
+                    } else {
+                        echo "用户名或密码错误";
+                    }
+                } else {
+                    echo "用户不存在";
+                }
+                $stmt->close();
+            } else {
+                echo "SQL 准备失败: " . $conn->error;
+            }
+        } else {
+            echo "请输入用户名和密码";
+        }
+    } else if (isset($_POST['action']) && $_POST['action'] === 'reslogin') {
+        $name = $_POST['name'] ?? '';
+        $UserPassword = $_POST['password'] ?? '';
+        $UserPassword2 = $_POST['passwordag'] ?? '';
+        if (!empty($name) && !empty($UserPassword) && !empty($UserPassword2)) {
+            if ($UserPassword == $UserPassword2) {
+
+                $result = $conn->query("SELECT COUNT(*) AS total FROM `user`");
+                $row1 = $result->fetch_assoc();
+
+                // 密码哈希加密
+                $hashed = password_hash($UserPassword, PASSWORD_DEFAULT);
+
+                $sql = "INSERT INTO `user` (`name`, `calling`, `password`, `alc`) VALUES (?, 'none', ?, '1');";
+                $stmt1 = $conn->prepare($sql);
+                if ($stmt1) {
+                    $stmt1->bind_param("ss", $name, $hashed);
+                    if ($stmt1->execute()) {
+                        echo "注册成功";
+                    } else {
+                        echo "注册失败: " . $stmt1->error;
+                    }
+                    $stmt1->close();
+                } else {
+                    echo "SQL 准备失败: " . $conn->error;
+                }
+            } else {
+                echo "两次密码不一致";
+            }
+        } else {
+            echo "请输入用户名和密码";
+        }
+    } else if (isset($_POST['action']) && $_POST['action'] === 'upload') {
+        // 只有权限为 1 的登录用户才能上传
+        if ($is_logged_in && ($user_info['alc'] == 1 || $user_info['alc'] == 2)) {
+            $uid     = intval($_POST['uid'] ?? 0);
+            $field   = $_POST['field'] ?? '';
+            $content = $_POST['content'] ?? '';
+            $allowed = ['A','B','C','D','E','F','G','H','I','J','K'];
+
+            if ($uid > 0 && in_array($field, $allowed, true)) {
+                $sql = "UPDATE `cook` SET `$field` = ? WHERE `uid` = ?";
+                $stmt = $conn->prepare($sql);
+                if ($stmt) {
+                    $stmt->bind_param("si", $content, $uid);
+                    if ($stmt->execute()) {
+                        echo "上传成功";
+                    } else {
+                        echo "上传失败: " . $stmt->error;
+                    }
+                    $stmt->close();
+                } else {
+                    echo "SQL 准备失败: " . $conn->error;
+                }
+            } else {
+                echo "参数错误";
+            }
+        } else {
+            echo "无权限上传";
+        }
+    }
+}
+?>
 
     <div class="<?php echo $is_logged_in ? 'visible' : 'hidden'; ?> div">
         <?php if ($is_logged_in): ?>
             <p>登录成功!</p>
             <p>ID: <?php echo htmlspecialchars($user_info['uid']); ?></p>
             <p>name: <?php echo htmlspecialchars($user_info['name']); ?></p>
-            <p>权限: <?php if ($user_info['alc'] == 1) echo "all."; else echo "none." ?></p>
+            <p>权限: <?php if ($user_info['alc'] == 2) echo "all."; else if ($user_info['alc'] == 1) echo "普通用户."; else echo "none." ?></p>
         <?php else: ?>
             <p>请先登录。</p>
         <?php endif; ?>
@@ -268,8 +296,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     
     <?php
         if ($is_logged_in) {
-          if ($user_info['alc'] == 1) {
-            echo "<div class='div'><a href='http://192.168.21.229/phpMyAdmin4.8.5/'>管理员界面</a></div>";
+          if ($user_info['alc'] == 1 || $user_info['alc'] == 2) {
+            if ($user_info['alc'] == 2) echo "<div class='div'><a href='http://192.168.21.229/phpMyAdmin4.8.5/'>管理员界面</a></div>";
             for ($i1 = 1; $i1 <= 2; $i1++) {
               $sql = "SELECT * FROM `cook` WHERE `uid` = $i1";
             $stmt = $conn->prepare($sql);
@@ -281,13 +309,13 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                   echo "<div class='div'>";
                   echo htmlspecialchars($row['name']);
                   echo " uid:$i1<br><br><button id='but$i1' onclick='ks($i1);'>显示</button><br><br>";
-                  echo "<div class='div' style='display: none' id='$i1'>";
+                  echo "<div class='div-h' style='display: none' id='$i1'>";
                   for ($i = 'A'; $i <= 'K'; $i++) {
                       if ($row[$i] == "none") continue;
-                      echo "<div class='div'><h3>" . $i . "</h3>";
+                      echo "<h3>" . $i . "</h3>";
                       echo "<pre><code class=\"language-cpp\">";
                       echo htmlspecialchars($row[$i]);
-                      echo "</code></pre></div>";
+                      echo "</code></pre>";
                   }
                   echo "</div></div>";
                 } else {
@@ -306,7 +334,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
           }
       ?>
 
-    <?php if ($is_logged_in && $user_info['alc'] == 1): ?>
+    <?php if ($is_logged_in && ($user_info['alc'] == 1 || $user_info['alc'] == 2)): ?>
     <div class="div">
         <h3>上传 / 修改 cook 内容</h3>
         <form method="POST">
@@ -332,7 +360,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         </form>
     </div>
     <?php endif; ?>
-
+    </div>
 <script>
 /* =========================================================
    内联 C++ 语法高亮器（零依赖）
