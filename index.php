@@ -1,16 +1,313 @@
+<?php
+/* ============================================================
+ * 【关键】所有 PHP 处理逻辑必须放在任何 HTML 输出之前！
+ * ============================================================ */
+
+$servername = "localhost";
+$username   = "root";
+$password   = "123456";
+$dbname     = "user";
+
+$conn = new mysqli($servername, $username, $password, $dbname);
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+$conn->set_charset("utf8mb4");
+
+/* ============================================================
+ * 【新增】贡献数 → 颜色 分级表
+ * 想改阈值/配色，只改这个数组即可。
+ * 数组从上到下匹配，命中第一个 num >= min 的项就返回。
+ * ============================================================ */
+function num_to_color($num) {
+    $tiers = [
+        ['min' => 500, 'color' => '#c0392b'],  // 深红  传说
+        ['min' => 200, 'color' => '#e74c3c'],  // 红    史诗
+        ['min' => 100, 'color' => '#e67e22'],  // 橙    稀有
+        ['min' => 50,  'color' => '#f1c40f'],  // 黄    精良
+        ['min' => 20,  'color' => '#2ecc71'],  // 绿    优秀
+        ['min' => 10,  'color' => '#1abc9c'],  // 青    良好
+        ['min' => 5,   'color' => '#3498db'],  // 蓝    普通
+        ['min' => 1,   'color' => '#95a5a6'],  // 灰    新手
+    ];
+    foreach ($tiers as $t) {
+        if ($num >= $t['min']) {
+            return $t['color'];
+        }
+    }
+    return '#95a5a6';  // 0 贡献：默认蓝
+}
+
+/* 管理员颜色永远锁定为 #8e44ad */
+function resolve_user_color($alc, $num) {
+    if ((int)$alc === 2) {
+        return '#8e44ad';
+    }
+    return num_to_color((int)$num);
+}
+/* ============================================================ */
+
+$is_logged_in = false;
+$user_info    = null;
+$msg          = '';
+
+/* ---------------- 1. 用 cookie 自动登录 ---------------- */
+if (!empty($_COOKIE['login_cookie'])) {
+    $token = $_COOKIE['login_cookie'];
+    $stmt  = $conn->prepare("SELECT `uid` FROM `cookie` WHERE `cookie` = ?");
+    if ($stmt) {
+        $stmt->bind_param("s", $token);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        if ($c = $res->fetch_assoc()) {
+            $uid = (int)$c['uid'];
+            $stmt->close();
+
+            $stmt = $conn->prepare("SELECT * FROM `user` WHERE `uid` = ?");
+            if ($stmt) {
+                $stmt->bind_param("i", $uid);
+                $stmt->execute();
+                $res = $stmt->get_result();
+                if ($row = $res->fetch_assoc()) {
+                    $is_logged_in = true;
+                    $user_info    = $row;
+                }
+                $stmt->close();
+            }
+        } else {
+            $stmt->close();
+            setcookie("login_cookie", "", time() - 3600, "/");
+        }
+    }
+}
+
+/* ---------------- 2. 处理 POST ---------------- */
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
+
+    $action = $_POST['action'] ?? '';
+
+    /* ---------- 登录 ---------- */
+    if ($action === 'login') {
+        $name         = $_POST['name'] ?? '';
+        $UserPassword = $_POST['password'] ?? '';
+
+        if ($name === '' || $UserPassword === '') {
+            $msg = "<br><span style='color:red'>请输入用户名和密码</span>";
+        } else {
+            $stmt = $conn->prepare("SELECT * FROM `user` WHERE `name` = ?");
+            if (!$stmt) {
+                $msg = "<br><span style='color:red'>SQL 准备失败: " . htmlspecialchars($conn->error) . "</span>";
+            } else {
+                $stmt->bind_param("s", $name);
+                $stmt->execute();
+                $result = $stmt->get_result();
+
+                if ($row = $result->fetch_assoc()) {
+                    if (password_verify($UserPassword, $row['password'])) {
+
+                        if (password_needs_rehash($row['password'], PASSWORD_DEFAULT)) {
+                            $newHash = password_hash($UserPassword, PASSWORD_DEFAULT);
+                            $upd = $conn->prepare("UPDATE `user` SET `password` = ? WHERE `uid` = ?");
+                            if ($upd) {
+                                $upd->bind_param("si", $newHash, $row['uid']);
+                                $upd->execute();
+                                $upd->close();
+                            }
+                        }
+
+                        $is_logged_in = true;
+                        $user_info    = $row;
+
+                        $token = bin2hex(random_bytes(32));
+
+                        $uid_for_cookie = (int)$row['uid'];
+
+                        $chk = $conn->prepare("SELECT `cookie` FROM `cookie` WHERE `uid` = ? LIMIT 1");
+                        if ($chk) {
+                            $chk->bind_param("i", $uid_for_cookie);
+                            $chk->execute();
+                            $chkRes = $chk->get_result();
+                            $existing = $chkRes->fetch_assoc();
+                            $chk->close();
+
+                            if ($existing) {
+                                $stmt2 = $conn->prepare("UPDATE `cookie` SET `cookie` = ? WHERE `uid` = ?");
+                                if ($stmt2) {
+                                    $stmt2->bind_param("si", $token, $uid_for_cookie);
+                                    $stmt2->execute();
+                                    $stmt2->close();
+                                }
+                            } else {
+                                $stmt2 = $conn->prepare("INSERT INTO `cookie` (`cookie`, `uid`) VALUES (?, ?)");
+                                if ($stmt2) {
+                                    $stmt2->bind_param("si", $token, $uid_for_cookie);
+                                    $stmt2->execute();
+                                    $stmt2->close();
+                                }
+                            }
+
+                            setcookie("login_cookie", $token, time() + 86400 * 30, "/", "", false, true);
+                        }
+                    } else {
+                        $msg = "<br><span style='color:red'>用户名或密码错误</span>";
+                    }
+                } else {
+                    $msg = "<br><span style='color:red'>用户不存在</span>";
+                }
+                $stmt->close();
+            }
+        }
+    }
+
+    /* ---------- 注册 ---------- */
+    else if ($action === 'reslogin') {
+        $name          = $_POST['name'] ?? '';
+        $UserPassword  = $_POST['password'] ?? '';
+        $UserPassword2 = $_POST['passwordag'] ?? '';
+
+        if ($name === '' || $UserPassword === '' || $UserPassword2 === '') {
+            $msg = "<br><span style='color:red'>请输入用户名和密码</span>";
+        } else if ($UserPassword !== $UserPassword2) {
+            $msg = "<br><span style='color:red'>两次密码不一致</span>";
+        } else {
+            $chk = $conn->prepare("SELECT `uid` FROM `user` WHERE `name` = ?");
+            $exists = false;
+            if ($chk) {
+                $chk->bind_param("s", $name);
+                $chk->execute();
+                $chkRes = $chk->get_result();
+                $exists = (bool)$chkRes->fetch_assoc();
+                $chk->close();
+            }
+
+            if ($exists) {
+                $msg = "<br><span style='color:red'>用户名已存在</span>";
+            } else {
+                $hashed = password_hash($UserPassword, PASSWORD_DEFAULT);
+                $stmt1  = $conn->prepare("INSERT INTO `user` (`name`, `calling`, `password`, `alc`, `color`) VALUES (?, 'none', ?, '1', '#0e90d2')");
+                if ($stmt1) {
+                    $stmt1->bind_param("ss", $name, $hashed);
+                    if ($stmt1->execute()) {
+                        $msg = "<br><span style='color:green'>注册成功，请登录</span>";
+                    } else {
+                        $msg = "<br><span style='color:red'>注册失败: " . htmlspecialchars($stmt1->error) . "</span>";
+                    }
+                    $stmt1->close();
+                } else {
+                    $msg = "<br><span style='color:red'>SQL 准备失败: " . htmlspecialchars($conn->error) . "</span>";
+                }
+            }
+        }
+    }
+
+    /* ---------- 上传 ---------- */
+    else if ($action === 'upload') {
+        if ($is_logged_in && ($user_info['alc'] == 1 || $user_info['alc'] == 2)) {
+            $uid     = intval($_POST['uid'] ?? 0);
+            $field   = $_POST['field'] ?? '';
+            $content = $_POST['content'] ?? '';
+            $allowed = ['A','B','C','D','E','F','G','H','I','J','K'];
+
+            if ($uid > 0 && in_array($field, $allowed, true)) {
+                $contributor = (string)$user_info['uid'];
+                $content     = $contributor . "\n" . $content;
+
+                $stmt = $conn->prepare("UPDATE `cook` SET `$field` = ? WHERE `uid` = ?");
+                if ($stmt) {
+                    $stmt->bind_param("si", $content, $uid);
+                    if ($stmt->execute()) {
+                        $msg = "<br><span style='color:green'>上传成功</span>";
+
+                        /* ★★★ num +1 并联动颜色 ★★★ */
+                        $contributor_uid = (int)$user_info['uid'];
+
+                        // 第一步：贡献数 +1
+                        $inc = $conn->prepare("UPDATE `user` SET `num` = COALESCE(`num`, 0) + 1 WHERE `uid` = ?");
+                        if ($inc) {
+                            $inc->bind_param("i", $contributor_uid);
+                            $inc->execute();
+                            $inc->close();
+
+                            // 第二步：读回最新 num / alc，按分级表算出新颜色
+                            $get_stmt = $conn->prepare("SELECT `num`, `alc` FROM `user` WHERE `uid` = ?");
+                            if ($get_stmt) {
+                                $get_stmt->bind_param("i", $contributor_uid);
+                                $get_stmt->execute();
+                                $g = $get_stmt->get_result()->fetch_assoc();
+                                $get_stmt->close();
+
+                                if ($g) {
+                                    $new_num = (int)$g['num'];
+                                    $new_alc = (int)$g['alc'];
+
+                                    // ★ 管理员永远 #8e44ad；其余按 num 分级表切换
+                                    $new_color = resolve_user_color($new_alc, $new_num);
+
+                                    // 第三步：写回颜色
+                                    $col_stmt = $conn->prepare("UPDATE `user` SET `color` = ? WHERE `uid` = ?");
+                                    if ($col_stmt) {
+                                        $col_stmt->bind_param("si", $new_color, $contributor_uid);
+                                        $col_stmt->execute();
+                                        $col_stmt->close();
+                                    }
+
+                                    // 刷新内存里的登录用户信息
+                                    $user_info['num']   = $new_num;
+                                    $user_info['color'] = $new_color;
+                                }
+                            }
+                        }
+                        /* ★★★ num +1 结束 ★★★ */
+
+                    } else {
+                        $msg = "<br><span style='color:red'>上传失败: " . htmlspecialchars($stmt->error) . "</span>";
+                    }
+                    $stmt->close();
+                } else {
+                    $msg = "<br><span style='color:red'>SQL 准备失败: " . htmlspecialchars($conn->error) . "</span>";
+                }
+            } else {
+                $msg = "<br><span style='color:red'>参数错误</span>";
+            }
+        } else {
+            $msg = "<br><span style='color:red'>无权限上传</span>";
+        }
+    }
+}
+
+/* ---------------- 3. 排行榜数据 ---------------- */
+$rank_rows  = [];
+$rank_error = '';
+if ($is_logged_in) {
+    $rank_stmt = $conn->prepare(
+        "SELECT `uid`, `name`, `calling`, `color`, `alc`, COALESCE(`num`, 0) AS `num`
+         FROM `user`
+         ORDER BY COALESCE(`num`, 0) DESC, `uid` ASC
+         LIMIT 50"
+    );
+    if ($rank_stmt) {
+        $rank_stmt->execute();
+        $rank_res = $rank_stmt->get_result();
+        while ($rr = $rank_res->fetch_assoc()) {
+            $rank_rows[] = $rr;
+        }
+        $rank_stmt->close();
+    } else {
+        $rank_error = '排行榜查询失败: ' . $conn->error;
+    }
+}
+?>
 <!DOCTYPE html>
 <html>
 <head>
     <title>欢迎</title>
     <meta charset="utf-8"/>
-    <!-- ★ 不再引用任何外部 CDN -->
     <style>
         body {
             background: #ffffff;
             color: #24292e;
             font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
         }
-        /* ★ 全局 div 只保留布局，去掉 1px 边框，避免满屏"框框线线" */
         div {
             position: relative;
             padding: 12px 0;
@@ -20,6 +317,7 @@
             padding: 20px;
             border: 1px solid #ccc;
             margin-top: 20px;
+            background-color: rgba(255, 255, 255, 0.75);
         }
         .div-h {
             position: relative;
@@ -35,10 +333,71 @@
             font-family: monospace;
         }
 
+        /* ================= 排行榜 ================= */
+        .rank-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }
+        .rank-table th,
+        .rank-table td {
+            padding: 7px 10px;
+            border-bottom: 1px solid #e1e4e8;
+            text-align: left;
+            vertical-align: middle;
+        }
+        .rank-table thead th {
+            background: #f6f8fa;
+            color: #57606a;
+            font-weight: 600;
+            font-size: 13px;
+            border-bottom: 1px solid #d0d7de;
+        }
+        .rank-table tbody tr:hover { background: #f6f8fa; }
+        .rank-table .rank-no {
+            width: 64px;
+            font-family: Consolas, Monaco, "Courier New", monospace;
+            color: #57606a;
+        }
+        .rank-table .rank-num {
+            width: 90px;
+            text-align: right;
+            font-family: Consolas, Monaco, "Courier New", monospace;
+            font-weight: 600;
+            color: #0550ae;
+        }
+        .rank-no.top1 { color: #b8860b; font-weight: 700; }
+        .rank-no.top2 { color: #8a8f98; font-weight: 700; }
+        .rank-no.top3 { color: #a0522d; font-weight: 700; }
+        .rank-me { background: #fff8e5 !important; }
+        .rank-tag {
+            font-size: 11px;
+            line-height: 1.4;
+            color: #1a7f37;
+            border: 1px solid #1a7f37;
+            border-radius: 3px;
+            padding: 0 4px;
+            margin-left: 6px;
+        }
+        .rank-uid {
+            font-size: 12px;
+            color: #8b949e;
+            margin-left: 6px;
+        }
+        .rank-admin-tag {
+            font-size: 11px;
+            line-height: 1.4;
+            color: #ffffff;
+            background: #8e44ad;
+            border-radius: 3px;
+            padding: 0 5px;
+            margin-left: 6px;
+        }
+
         /* ================= 代码块容器 + 顶部工具条 ================= */
         .code-block {
             position: relative;
-            padding: 0;                 /* 覆盖全局 div 的 padding */
+            padding: 0;
             margin: 6px 0 14px 0;
             background: #f8f9fa;
             border-radius: 6px;
@@ -54,9 +413,25 @@
             font-size: 12px;
             color: #57606a;
         }
+        .code-bar-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
         .code-lang {
             font-family: Consolas, Monaco, "Courier New", monospace;
             letter-spacing: .5px;
+        }
+        .code-contributor {
+            display: inline-flex;
+            align-items: center;
+            font-size: 12px;
+            line-height: 1.4;
+            color: #57606a;
+            background: #ffffff;
+            border: 1px solid #d0d7de;
+            border-radius: 4px;
+            padding: 1px 6px;
         }
         .copy-btn {
             font-size: 12px;
@@ -78,7 +453,7 @@
         pre { margin: 0; }
         code.language-cpp {
             display: block;
-            background: transparent;    /* 背景交给 .code-block */
+            background: transparent;
             color: #24292e;
             border: none;
             border-radius: 0;
@@ -91,20 +466,18 @@
             white-space: pre;
             tab-size: 4;
         }
-        /* token 配色：鲜明但不刺眼 */
-        code.language-cpp .tok-kw   { color: #cf222e; font-weight: 600; } /* 关键字 红 */
-        code.language-cpp .tok-type { color: #0550ae; }                   /* 类型/常用名 蓝 */
-        code.language-cpp .tok-str  { color: #0a3069; }                   /* 字符串 深蓝 */
-        code.language-cpp .tok-num  { color: #0550ae; }                   /* 数字 蓝 */
-        code.language-cpp .tok-com  { color: #6e7781; font-style: italic; } /* 注释 灰斜 */
-        code.language-cpp .tok-pre  { color: #8250df; }                   /* 预处理 紫 */
+        code.language-cpp .tok-kw   { color: #cf222e; font-weight: 600; }
+        code.language-cpp .tok-type { color: #0550ae; }
+        code.language-cpp .tok-str  { color: #0a3069; }
+        code.language-cpp .tok-num  { color: #0550ae; }
+        code.language-cpp .tok-com  { color: #6e7781; font-style: italic; }
+        code.language-cpp .tok-pre  { color: #8250df; }
     </style>
 </head>
 <body>
   <div class='div' style="width:50%; left: 25%">
     <h1>欢迎！</h1>
 
-    <!-- 登录表单 -->
     <form method="POST" id="l">
         <input type="hidden" name="action" value="login">
         <label>用户名: <input type="text" name="name" required></label><br>
@@ -117,222 +490,187 @@
         <label>密&emsp;码: <input type="password" name="password" required></label><br>
         <label>确&emsp;认: <input type="password" name="passwordag" required></label><br><br>
         &emsp;&emsp;&emsp;&ensp;<button type="submit">注册</button>&emsp;<button type="button" onclick="ToR();">转换到登录页</button>
-    </form><br>
+    </form>
 
-    <?php
-$servername = "localhost";
-$username = "root";
-$password = "123456";
-$dbname = "user"; 
-
-$conn = new mysqli($servername, $username, $password, $dbname);
-if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
-}
-
-$conn->set_charset("utf8mb4");
-$is_logged_in = false;
-$user_info = null;
-
-// 用 cookie 自动登录（GET 和 POST 都生效）
-if (!empty($_COOKIE['login_cookie'])) {
-    $token = $_COOKIE['login_cookie'];
-    $stmt = $conn->prepare("SELECT `uid` FROM `cookie` WHERE `cookie` = ?");
-    if ($stmt) {
-        $stmt->bind_param("s", $token);
-        $stmt->execute();
-        $res = $stmt->get_result();
-        if ($c = $res->fetch_assoc()) {
-            $uid = $c['uid'];
-            $stmt->close();
-
-            $stmt = $conn->prepare("SELECT * FROM `user` WHERE `uid` = ?");
-            if ($stmt) {
-                $stmt->bind_param("i", $uid);
-                $stmt->execute();
-                $res = $stmt->get_result();
-                if ($row = $res->fetch_assoc()) {
-                    $is_logged_in = true;
-                    $user_info = $row;
-                }
-                $stmt->close();
-            }
-        } else {
-            $stmt->close();
-        }
-    }
-}
-
-if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
-    if (isset($_POST['action']) && $_POST['action'] === 'login') {
-        $name = $_POST['name'] ?? '';
-        $UserPassword = $_POST['password'] ?? '';
-        if (!empty($name) && !empty($UserPassword)) {
-            $sql = "SELECT * FROM `user` WHERE `name` = ?";
-            $stmt = $conn->prepare($sql);
-            if ($stmt) {
-                $stmt->bind_param("s", $name);
-                $stmt->execute();
-                $result = $stmt->get_result();
-                
-                if ($row = $result->fetch_assoc()) {
-                    $login_ok = false;
-
-                    // 仅使用哈希验证（明文密码一律视为错误）
-                    if (password_verify($UserPassword, $row['password'])) {
-                        $login_ok = true;
-
-                        // 若哈希算法/成本已过时，自动升级为当前默认算法
-                        if (password_needs_rehash($row['password'], PASSWORD_DEFAULT)) {
-                            $newHash = password_hash($UserPassword, PASSWORD_DEFAULT);
-                            $upd = $conn->prepare("UPDATE `user` SET `password` = ? WHERE `uid` = ?");
-                            if ($upd) {
-                                $upd->bind_param("si", $newHash, $row['uid']);
-                                $upd->execute();
-                                $upd->close();
-                            }
-                        }
-                    }
-
-                    if ($login_ok) {
-                        $is_logged_in = true;
-                        $user_info = $row;
-
-                        $token = bin2hex(random_bytes(32));
-                        $stmt2 = $conn->prepare("INSERT INTO `cookie` (`cookie`, `uid`) VALUES (?, ?)");
-                        if ($stmt2) {
-                            $stmt2->bind_param("si", $token, $row['uid']);
-                            $stmt2->execute();
-                            $stmt2->close();
-                            setcookie("login_cookie", $token, time() + 86400 * 30, "/");
-                        }
-                    } else {
-                        echo "用户名或密码错误";
-                    }
-                } else {
-                    echo "用户不存在";
-                }
-                $stmt->close();
-            } else {
-                echo "SQL 准备失败: " . $conn->error;
-            }
-        } else {
-            echo "请输入用户名和密码";
-        }
-    } else if (isset($_POST['action']) && $_POST['action'] === 'reslogin') {
-        $name = $_POST['name'] ?? '';
-        $UserPassword = $_POST['password'] ?? '';
-        $UserPassword2 = $_POST['passwordag'] ?? '';
-        if (!empty($name) && !empty($UserPassword) && !empty($UserPassword2)) {
-            if ($UserPassword == $UserPassword2) {
-
-                $result = $conn->query("SELECT COUNT(*) AS total FROM `user`");
-                $row1 = $result->fetch_assoc();
-
-                // 密码哈希加密
-                $hashed = password_hash($UserPassword, PASSWORD_DEFAULT);
-
-                $sql = "INSERT INTO `user` (`name`, `calling`, `password`, `alc`) VALUES (?, 'none', ?, '1');";
-                $stmt1 = $conn->prepare($sql);
-                if ($stmt1) {
-                    $stmt1->bind_param("ss", $name, $hashed);
-                    if ($stmt1->execute()) {
-                        echo "注册成功";
-                    } else {
-                        echo "注册失败: " . $stmt1->error;
-                    }
-                    $stmt1->close();
-                } else {
-                    echo "SQL 准备失败: " . $conn->error;
-                }
-            } else {
-                echo "两次密码不一致";
-            }
-        } else {
-            echo "请输入用户名和密码";
-        }
-    } else if (isset($_POST['action']) && $_POST['action'] === 'upload') {
-        // 只有权限为 1 的登录用户才能上传
-        if ($is_logged_in && ($user_info['alc'] == 1 || $user_info['alc'] == 2)) {
-            $uid     = intval($_POST['uid'] ?? 0);
-            $field   = $_POST['field'] ?? '';
-            $content = $_POST['content'] ?? '';
-            $allowed = ['A','B','C','D','E','F','G','H','I','J','K'];
-
-            if ($uid > 0 && in_array($field, $allowed, true)) {
-                $sql = "UPDATE `cook` SET `$field` = ? WHERE `uid` = ?";
-                $stmt = $conn->prepare($sql);
-                if ($stmt) {
-                    $stmt->bind_param("si", $content, $uid);
-                    if ($stmt->execute()) {
-                        echo "上传成功";
-                    } else {
-                        echo "上传失败: " . $stmt->error;
-                    }
-                    $stmt->close();
-                } else {
-                    echo "SQL 准备失败: " . $conn->error;
-                }
-            } else {
-                echo "参数错误";
-            }
-        } else {
-            echo "无权限上传";
-        }
-    }
-}
-?>
+    <?php echo $msg; ?>
 
     <div class="<?php echo $is_logged_in ? 'visible' : 'hidden'; ?> div">
         <?php if ($is_logged_in): ?>
+            <?php $my_display_color = resolve_user_color($user_info['alc'] ?? 0, $user_info['num'] ?? 0); ?>
             <p>登录成功!</p>
             <p>ID: <?php echo htmlspecialchars($user_info['uid']); ?></p>
-            <p>name: <?php echo htmlspecialchars($user_info['name']); ?></p>
+            <p>name: <?php echo "<strong style='color: " . htmlspecialchars($my_display_color) . "'>" . htmlspecialchars($user_info['name']) . "</strong>";
+                if ($user_info['calling'] !== 'none' && $user_info['calling'] !== '') {
+                    echo "&thinsp;<strong style='font-size: 80%; border-radius: 3px; color: white; background-color: " . htmlspecialchars($my_display_color) . "'>&ensp;" . htmlspecialchars($user_info['calling']) . "&ensp;</strong>";
+                } ?></p>
             <p>权限: <?php if ($user_info['alc'] == 2) echo "all."; else if ($user_info['alc'] == 1) echo "普通用户."; else echo "none." ?></p>
+            <p>贡献数: <?php echo (int)($user_info['num'] ?? 0); ?></p>
         <?php else: ?>
             <p>请先登录。</p>
         <?php endif; ?>
     </div>
-    
+
     <?php
         if ($is_logged_in) {
           if ($user_info['alc'] == 1 || $user_info['alc'] == 2) {
             if ($user_info['alc'] == 2) echo "<div class='div'><a href='http://192.168.21.229/phpMyAdmin4.8.5/'>管理员界面</a></div>";
-            for ($i1 = 1; $i1 <= 2; $i1++) {
-              $sql = "SELECT * FROM `cook` WHERE `uid` = $i1";
-            $stmt = $conn->prepare($sql);
-            if ($stmt) {
+
+            $user_cache = [];
+
+            $stmt1 = $conn->prepare("SELECT * FROM `cook`");
+            if ($stmt1) {
+                $stmt1->bind_param("i", $i1);
+                $stmt1->execute();
+                $result1 = $stmt1->get_result();
+                for ($i1 = 1; $i1 <= $result1->num_rows; $i1++) {
+              $stmt = $conn->prepare("SELECT * FROM `cook` WHERE `uid` = ?");
+              if ($stmt) {
+                $stmt->bind_param("i", $i1);
                 $stmt->execute();
                 $result = $stmt->get_result();
-                
+
                 if ($row = $result->fetch_assoc()) {
-                  echo "<div class='div'>";
+                  echo "<div class='div'>$i1. ";
                   echo htmlspecialchars($row['name']);
-                  echo " uid:$i1<br><br><button id='but$i1' onclick='ks($i1);'>显示</button><br><br>";
+                  echo "<button style='position: absolute; right: 20px;' id='but$i1' onclick='ks($i1);'>显示</button>";
                   echo "<div class='div-h' style='display: none' id='$i1'>";
-                  for ($i = 'A'; $i <= 'K'; $i++) {
-                      if ($row[$i] == "none") continue;
+
+                  foreach (range('A', 'Z') as $i) {
+                      if ($row[$i] == "none" or $row[$i] == "") continue;
+
+                      $raw = $row[$i];
+                      $nl  = strpos($raw, "\n");
+
+                      if ($nl === false) {
+                          $first = trim($raw);
+                          $code  = '';
+                      } else {
+                          $first = trim(substr($raw, 0, $nl));
+                          $code  = substr($raw, $nl + 1);
+                      }
+
+                      $contributor = null;
+                      if ($first !== '' && ctype_digit($first)) {
+                          $contributor = $first;
+                      } else {
+                          $code = $raw;
+                      }
+
                       echo "<h3>" . $i . "</h3>";
+
+                      if ($contributor !== null) {
+                          $cu = null;
+                          if (array_key_exists($contributor, $user_cache)) {
+                              $cu = $user_cache[$contributor];
+                          } else {
+                              // ★ 增加 alc、num 字段用于颜色解析
+                              $cu_stmt = $conn->prepare("SELECT `name`, `calling`, `color`, `alc`, `num` FROM `user` WHERE `uid` = ?");
+                              if ($cu_stmt) {
+                                  $cu_uid = intval($contributor);
+                                  $cu_stmt->bind_param("i", $cu_uid);
+                                  $cu_stmt->execute();
+                                  $cu_res = $cu_stmt->get_result();
+                                  $cu = $cu_res->fetch_assoc();
+                                  $cu_stmt->close();
+                              }
+                              $user_cache[$contributor] = $cu;
+                          }
+
+                          if ($cu) {
+                              // ★ 用 resolve_user_color 统一算色（管理员锁定 #8e44ad）
+                              $cu_color = resolve_user_color($cu['alc'] ?? 0, $cu['num'] ?? 0);
+                              $ch = "贡献者：<strong style='color: " . htmlspecialchars($cu_color) . "'>"
+                                  . htmlspecialchars($cu['name']) . "</strong>";
+                              if ($cu['calling'] !== 'none' && $cu['calling'] !== '') {
+                                  $ch .= "&thinsp;<strong style='font-size: 80%; border-radius: 2px; color: white; background-color: "
+                                       . htmlspecialchars($cu_color) . "'>&ensp;"
+                                       . htmlspecialchars($cu['calling']) . "&ensp;</strong>";
+                              }
+                          } else {
+                              $ch = "UID: " . htmlspecialchars($contributor);
+                          }
+
+                          echo "<span class='code-contributor-source' style='display:none'>" . $ch . "</span>";
+                      }
+
                       echo "<pre><code class=\"language-cpp\">";
-                      echo htmlspecialchars($row[$i]);
+                      echo htmlspecialchars($code);
                       echo "</code></pre>";
                   }
+
                   echo "</div></div>";
                 } else {
-                    echo "<div class='div'>暂无数据 uid:$i1</div>";
-                } $stmt->close();
-            } else {
-                echo "SQL 准备失败: " . $conn->error;
+                    echo "<div class='div'>$i1. 暂无数据</div>";
+                }
+                $stmt->close();
+              } else {
+                echo "<br>SQL 准备失败: " . htmlspecialchars($conn->error);
+              }
             }
             }
+
           } else {
             echo "<div class='div'>请联系管理员提权</div>";
             echo "<div class='div'>你无权限查看</div>";
           }
         } else {
             echo "<div class='div'>请先登录</div>";
-          }
+        }
       ?>
+
+    <?php /* ================= 贡献排行榜 ================= */ ?>
+    <?php if ($is_logged_in): ?>
+    <div class="div" id="rank">
+        <h3>贡献排行榜</h3>
+
+        <?php if ($rank_error !== ''): ?>
+            <p style="color:#cf222e"><?php echo htmlspecialchars($rank_error); ?></p>
+        <?php elseif (empty($rank_rows)): ?>
+            <p>暂无排行数据。</p>
+        <?php else: ?>
+            <table class="rank-table">
+                <thead>
+                    <tr>
+                        <th>排名</th>
+                        <th>用户</th>
+                        <th style="text-align:right;">贡献数</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php
+                    $rank_no = 0;
+                    foreach ($rank_rows as $rr):
+                        $rank_no++;
+                        $is_me    = ((int)$rr['uid'] === (int)$user_info['uid']);
+                        $no_class = '';
+                        if ($rank_no === 1)      $no_class = ' top1';
+                        else if ($rank_no === 2) $no_class = ' top2';
+                        else if ($rank_no === 3) $no_class = ' top3';
+                        // ★ 使用统一算色：管理员 #8e44ad，其余按 num 分级
+                        $r_color   = resolve_user_color($rr['alc'] ?? 0, $rr['num'] ?? 0);
+                        $r_calling = (string)($rr['calling'] ?? '');
+                        $r_is_admin = ((int)($rr['alc'] ?? 0) === 2);
+                ?>
+                    <tr class="<?php echo $is_me ? 'rank-me' : ''; ?>">
+                        <td class="rank-no<?php echo $no_class; ?>"><?php echo $rank_no; ?></td>
+                        <td>
+                            <strong style="color: <?php echo htmlspecialchars($r_color); ?>">
+                                <?php echo htmlspecialchars((string)$rr['name']); ?>
+                            </strong>
+                            <?php if ($r_calling !== 'none' && $r_calling !== ''): ?>
+                                <strong style="font-size: 80%; border-radius: 3px; color: white; background-color: <?php echo htmlspecialchars($r_color); ?>">&ensp;<?php echo htmlspecialchars($r_calling); ?>&ensp;</strong>
+                            <?php endif; ?>
+                            <?php if ($is_me): ?><span class="rank-tag">我</span><?php endif; ?>
+                            <span class="rank-uid">UID: <?php echo (int)$rr['uid']; ?></span>
+                        </td>
+                        <td class="rank-num"><?php echo (int)$rr['num']; ?></td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
 
     <?php if ($is_logged_in && ($user_info['alc'] == 1 || $user_info['alc'] == 2)): ?>
     <div class="div">
@@ -359,14 +697,22 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             <button type="submit">上传</button>
         </form>
     </div>
+    <br><button onclick="NewWorld();">New World?</button>
     <?php endif; ?>
     </div>
 <script>
-/* =========================================================
-   内联 C++ 语法高亮器（零依赖）
-   顺序：注释 → 字符串/字符 → 预处理 → 数字 → 标识符
-   所有 token 输出前先做 HTML 转义，避免实体冲突
-   ========================================================= */
+
+function NewWorld() {
+  var url = 'url("https://cdn.luogu.com.cn/upload/image_hosting/uds71m1q.png")';
+  [document.documentElement, document.body].forEach(function (el) {
+    el.style.backgroundImage      = url;
+    el.style.backgroundSize       = 'cover';
+    el.style.backgroundPosition   = 'center center';
+    el.style.backgroundRepeat     = 'no-repeat';
+    el.style.backgroundAttachment = 'fixed';
+  });
+}
+
 (function () {
   var KEYWORDS = new Set([
     'alignas','alignof','asm','auto','bool','break','case','catch','char','char16_t','char32_t',
@@ -413,7 +759,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     return out;
   }
 
-  /* ---------- 复制到剪贴板（兼容 http 非安全上下文） ---------- */
   var DEFAULT_TIP = '复制代码';
 
   function copyText(text, btn) {
@@ -430,7 +775,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
       }, 1500);
     }
 
-    // 兜底方案：execCommand（http 页面同样可用）
     function fallback() {
       var ta = document.createElement('textarea');
       ta.value = text;
@@ -461,27 +805,37 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     }
   }
 
-  /* ---------- 给每个代码块套上工具条 + 复制按钮 ---------- */
-  function wrapCodeBlock(pre, raw) {
+  function wrapCodeBlock(pre, contributorEl) {
     var wrap = document.createElement('div');
     wrap.className = 'code-block';
 
     var bar = document.createElement('div');
     bar.className = 'code-bar';
 
+    var left = document.createElement('span');
+    left.className = 'code-bar-left';
+
     var lang = document.createElement('span');
     lang.className = 'code-lang';
     lang.textContent = 'C++';
+    left.appendChild(lang);
+
+    if (contributorEl && contributorEl.innerHTML.trim() !== '') {
+      var c = document.createElement('span');
+      c.className = 'code-contributor';
+      c.innerHTML = contributorEl.innerHTML;
+      left.appendChild(c);
+    }
 
     var btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'copy-btn';
     btn.textContent = DEFAULT_TIP;
     btn.addEventListener('click', function () {
-      copyText(raw, btn);
+      copyText(pre.textContent, btn);
     });
 
-    bar.appendChild(lang);
+    bar.appendChild(left);
     bar.appendChild(btn);
 
     pre.parentNode.insertBefore(wrap, pre);
@@ -490,17 +844,21 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
   }
 
   document.querySelectorAll('code.language-cpp').forEach(function (el) {
-    var raw = el.textContent;      // 先取纯文本，再高亮
+    var raw = el.textContent;
     el.innerHTML = highlight(raw);
 
     var pre = el.parentNode;
     if (pre && pre.tagName === 'PRE') {
-      wrapCodeBlock(pre, raw);
+      var prev = pre.previousElementSibling;
+      var contributorEl = (prev && prev.classList.contains('code-contributor-source')) ? prev : null;
+
+      wrapCodeBlock(pre, contributorEl);
+
+      if (contributorEl) contributorEl.remove();
     }
   });
 })();
 
-/* 原来的交互函数保持不变 */
 function ToL() {
   document.getElementById('l').style.display = "none";
   document.getElementById('r').style.display = "block";
