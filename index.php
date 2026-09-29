@@ -15,30 +15,27 @@ if ($conn->connect_error) {
 $conn->set_charset("utf8mb4");
 
 /* ============================================================
- * 【新增】贡献数 → 颜色 分级表
- * 想改阈值/配色，只改这个数组即可。
- * 数组从上到下匹配，命中第一个 num >= min 的项就返回。
+ * 贡献数 → 颜色 分级表
  * ============================================================ */
 function num_to_color($num) {
     $tiers = [
-        ['min' => 500, 'color' => '#c0392b'],  // 深红  传说
-        ['min' => 200, 'color' => '#e74c3c'],  // 红    史诗
-        ['min' => 100, 'color' => '#e67e22'],  // 橙    稀有
-        ['min' => 50,  'color' => '#f1c40f'],  // 黄    精良
-        ['min' => 20,  'color' => '#2ecc71'],  // 绿    优秀
-        ['min' => 10,  'color' => '#1abc9c'],  // 青    良好
-        ['min' => 5,   'color' => '#3498db'],  // 蓝    普通
-        ['min' => 1,   'color' => '#95a5a6'],  // 灰    新手
+        ['min' => 500, 'color' => '#c0392b'],
+        ['min' => 200, 'color' => '#e74c3c'],
+        ['min' => 100, 'color' => '#e67e22'],
+        ['min' => 50,  'color' => '#f1c40f'],
+        ['min' => 20,  'color' => '#2ecc71'],
+        ['min' => 10,  'color' => '#1abc9c'],
+        ['min' => 5,   'color' => '#3498db'],
+        ['min' => 1,   'color' => '#95a5a6'],
     ];
     foreach ($tiers as $t) {
         if ($num >= $t['min']) {
             return $t['color'];
         }
     }
-    return '#95a5a6';  // 0 贡献：默认蓝
+    return '#95a5a6';
 }
 
-/* 管理员颜色永远锁定为 #8e44ad */
 function resolve_user_color($alc, $num) {
     if ((int)$alc === 2) {
         return '#8e44ad';
@@ -184,7 +181,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $msg = "<br><span style='color:red'>用户名已存在</span>";
             } else {
                 $hashed = password_hash($UserPassword, PASSWORD_DEFAULT);
-                $stmt1  = $conn->prepare("INSERT INTO `user` (`name`, `calling`, `password`, `alc`, `color`) VALUES (?, 'none', ?, '1', '#0e90d2')");
+                $stmt1  = $conn->prepare("INSERT INTO `user` (`name`, `calling`, `password`, `alc`, `color`, `num`) VALUES (?, 'none', ?, '1', '#0e90d2', '0')");
                 if ($stmt1) {
                     $stmt1->bind_param("ss", $name, $hashed);
                     if ($stmt1->execute()) {
@@ -206,11 +203,20 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $uid     = intval($_POST['uid'] ?? 0);
             $field   = $_POST['field'] ?? '';
             $content = $_POST['content'] ?? '';
+            /* ★ 新增：标题 */
+            $title   = trim($_POST['title'] ?? '');
             $allowed = ['A','B','C','D','E','F','G','H','I','J','K'];
 
             if ($uid > 0 && in_array($field, $allowed, true)) {
                 $contributor = (string)$user_info['uid'];
-                $content     = $contributor . "\n" . $content;
+
+                /* ★ 新格式：首行 = "uid 标题"（标题可空），第二行开始为代码
+                 *   标题为空时退化为老的 "uid\n"，保证向后兼容 */
+                if ($title !== '') {
+                    $content = $contributor . ' ' . $title . "\n" . $content;
+                } else {
+                    $content = $contributor . "\n" . $content;
+                }
 
                 $stmt = $conn->prepare("UPDATE `cook` SET `$field` = ? WHERE `uid` = ?");
                 if ($stmt) {
@@ -218,17 +224,14 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     if ($stmt->execute()) {
                         $msg = "<br><span style='color:green'>上传成功</span>";
 
-                        /* ★★★ num +1 并联动颜色 ★★★ */
                         $contributor_uid = (int)$user_info['uid'];
 
-                        // 第一步：贡献数 +1
                         $inc = $conn->prepare("UPDATE `user` SET `num` = COALESCE(`num`, 0) + 1 WHERE `uid` = ?");
                         if ($inc) {
                             $inc->bind_param("i", $contributor_uid);
                             $inc->execute();
                             $inc->close();
 
-                            // 第二步：读回最新 num / alc，按分级表算出新颜色
                             $get_stmt = $conn->prepare("SELECT `num`, `alc` FROM `user` WHERE `uid` = ?");
                             if ($get_stmt) {
                                 $get_stmt->bind_param("i", $contributor_uid);
@@ -239,11 +242,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                                 if ($g) {
                                     $new_num = (int)$g['num'];
                                     $new_alc = (int)$g['alc'];
-
-                                    // ★ 管理员永远 #8e44ad；其余按 num 分级表切换
                                     $new_color = resolve_user_color($new_alc, $new_num);
 
-                                    // 第三步：写回颜色
                                     $col_stmt = $conn->prepare("UPDATE `user` SET `color` = ? WHERE `uid` = ?");
                                     if ($col_stmt) {
                                         $col_stmt->bind_param("si", $new_color, $contributor_uid);
@@ -251,13 +251,11 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                                         $col_stmt->close();
                                     }
 
-                                    // 刷新内存里的登录用户信息
                                     $user_info['num']   = $new_num;
                                     $user_info['color'] = $new_color;
                                 }
                             }
                         }
-                        /* ★★★ num +1 结束 ★★★ */
 
                     } else {
                         $msg = "<br><span style='color:red'>上传失败: " . htmlspecialchars($stmt->error) . "</span>";
@@ -271,6 +269,54 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             }
         } else {
             $msg = "<br><span style='color:red'>无权限上传</span>";
+        }
+    }
+
+    /* ---------- 新建 cook（仅 alc=2 管理员） ---------- */
+    else if ($action === 'create_cook') {
+        if ($is_logged_in && (int)$user_info['alc'] === 2) {
+            $new_uid  = intval($_POST['new_uid']  ?? 0);
+            $new_name = trim($_POST['new_name']   ?? '');
+
+            if ($new_uid <= 0) {
+                $msg = "<br><span style='color:red'>请输入合法的 UID（正整数）</span>";
+            } else if ($new_name === '') {
+                $msg = "<br><span style='color:red'>请输入名称</span>";
+            } else {
+                $chk = $conn->prepare("SELECT `uid` FROM `cook` WHERE `uid` = ? LIMIT 1");
+                $exists = false;
+                if ($chk) {
+                    $chk->bind_param("i", $new_uid);
+                    $chk->execute();
+                    $chkRes = $chk->get_result();
+                    $exists = (bool)$chkRes->fetch_assoc();
+                    $chk->close();
+                }
+
+                if ($exists) {
+                    $msg = "<br><span style='color:red'>UID " . $new_uid . " 已存在，不能重复新建</span>";
+                } else {
+                    $stmt = $conn->prepare(
+                        "INSERT INTO `cook`
+                           (`uid`, `name`, `A`, `B`, `C`, `D`, `E`, `F`, `G`, `H`, `I`, `J`, `K`)
+                         VALUES
+                           (?, ?, 'none','none','none','none','none','none','none','none','none','none','none')"
+                    );
+                    if ($stmt) {
+                        $stmt->bind_param("is", $new_uid, $new_name);
+                        if ($stmt->execute()) {
+                            $msg = "<br><span style='color:green'>新建 cook 成功：UID=" . $new_uid . "</span>";
+                        } else {
+                            $msg = "<br><span style='color:red'>新建失败: " . htmlspecialchars($stmt->error) . "</span>";
+                        }
+                        $stmt->close();
+                    } else {
+                        $msg = "<br><span style='color:red'>SQL 准备失败: " . htmlspecialchars($conn->error) . "</span>";
+                    }
+                }
+            }
+        } else {
+            $msg = "<br><span style='color:red'>无权限新建 cook</span>";
         }
     }
 }
@@ -394,6 +440,64 @@ if ($is_logged_in) {
             margin-left: 6px;
         }
 
+        /* ================= 字段折叠（题号 + 按钮） ================= */
+        .field-block {
+            margin: 8px 0 14px 0;
+            border: 1px solid #e1e4e8;
+            border-radius: 6px;
+            background: #ffffff;
+            overflow: hidden;
+        }
+        .field-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 12px;
+            background: #f6f8fa;
+        }
+        .field-block.expanded .field-head {
+            border-bottom: 1px solid #e1e4e8;
+        }
+        .field-title {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 8px;
+            font-family: Consolas, Monaco, "Courier New", monospace;
+            font-weight: 600;
+            font-size: 14px;
+            color: #24292e;
+            letter-spacing: .5px;
+        }
+        /* ★ 题号后紧跟的标题 */
+        .field-title-text {
+            font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+            font-weight: 400;
+            font-size: 13px;
+            color: #57606a;
+            letter-spacing: 0;
+            max-width: 620px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .field-toggle {
+            font-size: 12px;
+            line-height: 1;
+            padding: 5px 10px;
+            color: #24292e;
+            background: #ffffff;
+            border: 1px solid #d0d7de;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background .15s, border-color .15s;
+            flex-shrink: 0;
+        }
+        .field-toggle:hover  { background: #f3f4f6; border-color: #afb8c1; }
+        .field-toggle:active { background: #ebecf0; }
+        .field-body {
+            padding: 10px 12px 0 12px;
+        }
+
         /* ================= 代码块容器 + 顶部工具条 ================= */
         .code-block {
             position: relative;
@@ -475,7 +579,7 @@ if ($is_logged_in) {
     </style>
 </head>
 <body>
-  <div class='div' style="width:50%; left: 25%">
+  <div class='div' style="width:1000px; left: calc(50% - 500px)">
     <h1>欢迎！</h1>
 
     <form method="POST" id="l">
@@ -549,21 +653,58 @@ if ($is_logged_in) {
                           $code  = substr($raw, $nl + 1);
                       }
 
+                      /* ============================================================
+                       * ★ 首行解析（新格式：uid 标题）
+                       *   - "123 两数之和"     → uid=123, title="两数之和"
+                       *   - "123"（旧格式）    → uid=123, title=""
+                       *   - 其它（老代码无前缀）→ 整段当代码显示
+                       * ============================================================ */
                       $contributor = null;
-                      if ($first !== '' && ctype_digit($first)) {
-                          $contributor = $first;
-                      } else {
-                          $code = $raw;
+                      $field_title = '';
+
+                      if ($first !== '') {
+                          $sp = strpos($first, ' ');
+                          if ($sp === false) {
+                              // 首行只有一个 token
+                              if (ctype_digit($first)) {
+                                  $contributor = $first;
+                              } else {
+                                  // 不是 uid，按老数据处理
+                                  $code = $raw;
+                              }
+                          } else {
+                              $uid_part   = substr($first, 0, $sp);
+                              $title_part = trim(substr($first, $sp + 1));
+                              if (ctype_digit($uid_part)) {
+                                  $contributor = $uid_part;
+                                  $field_title = $title_part;
+                              } else {
+                                  // 首 token 不是纯数字 → 老数据整段当代码
+                                  $code = $raw;
+                              }
+                          }
                       }
 
-                      echo "<h3>" . $i . "</h3>";
+                      /* ★ 每个字段一个唯一 key：cookUid_字母 */
+                      $field_key = $i1 . '_' . $i;
+
+                      /* ★ 折叠容器：head 里放题号 + 标题 + 按钮，body 里放贡献者+代码，默认隐藏 */
+                      echo "<div class='field-block' id='fb_" . $field_key . "'>";
+                      echo "  <div class='field-head'>";
+                      echo "    <span class='field-title'>" . $i;
+                      if ($field_title !== '') {
+                          echo "<span class='field-title-text'>" . htmlspecialchars($field_title) . "</span>";
+                      }
+                      echo "    </span>";
+                      echo "    <button type='button' class='field-toggle' id='ft_but_" . $field_key . "' onclick='toggleField(\"" . $field_key . "\");'>展开</button>";
+                      echo "  </div>";
+                      echo "  <div class='field-body' id='ft_body_" . $field_key . "' style='display:none;'>";
 
                       if ($contributor !== null) {
                           $cu = null;
                           if (array_key_exists($contributor, $user_cache)) {
                               $cu = $user_cache[$contributor];
                           } else {
-                              // ★ 增加 alc、num 字段用于颜色解析
                               $cu_stmt = $conn->prepare("SELECT `name`, `calling`, `color`, `alc`, `num` FROM `user` WHERE `uid` = ?");
                               if ($cu_stmt) {
                                   $cu_uid = intval($contributor);
@@ -577,7 +718,6 @@ if ($is_logged_in) {
                           }
 
                           if ($cu) {
-                              // ★ 用 resolve_user_color 统一算色（管理员锁定 #8e44ad）
                               $cu_color = resolve_user_color($cu['alc'] ?? 0, $cu['num'] ?? 0);
                               $ch = "贡献者：<strong style='color: " . htmlspecialchars($cu_color) . "'>"
                                   . htmlspecialchars($cu['name']) . "</strong>";
@@ -596,6 +736,9 @@ if ($is_logged_in) {
                       echo "<pre><code class=\"language-cpp\">";
                       echo htmlspecialchars($code);
                       echo "</code></pre>";
+
+                      echo "  </div>";  // /field-body
+                      echo "</div>";    // /field-block
                   }
 
                   echo "</div></div>";
@@ -646,7 +789,6 @@ if ($is_logged_in) {
                         if ($rank_no === 1)      $no_class = ' top1';
                         else if ($rank_no === 2) $no_class = ' top2';
                         else if ($rank_no === 3) $no_class = ' top3';
-                        // ★ 使用统一算色：管理员 #8e44ad，其余按 num 分级
                         $r_color   = resolve_user_color($rr['alc'] ?? 0, $rr['num'] ?? 0);
                         $r_calling = (string)($rr['calling'] ?? '');
                         $r_is_admin = ((int)($rr['alc'] ?? 0) === 2);
@@ -693,10 +835,27 @@ if ($is_logged_in) {
                     <option value="K">K</option>
                 </select>
             </label><br><br>
+            <label>标题: <input type="text" name="title" maxlength="100" style="width:400px;" placeholder="（可空）显示在题号后面"></label><br><br>
             <label>内容:<br><textarea name="content" rows="8"></textarea></label><br><br>
             <button type="submit">上传</button>
         </form>
     </div>
+    <?php endif; ?>
+
+    <?php /* ================= 新建 cook（仅 alc=2 管理员） ================= */ ?>
+    <?php if ($is_logged_in && (int)$user_info['alc'] === 2): ?>
+    <div class="div">
+        <h3>新建 cook </h3>
+        <form method="POST" onsubmit="return confirm('确认新建该 cook 吗？');">
+            <input type="hidden" name="action" value="create_cook">
+            <label>新 UID: <input type="number" name="new_uid" min="1" required></label><br><br>
+            <label>名称: <input type="text" name="new_name" maxlength="100" required style="width:320px;"></label><br><br>
+            <button type="submit">新建</button>
+        </form>
+    </div>
+    <?php endif; ?>
+
+    <?php if ($is_logged_in && ($user_info['alc'] == 1 || $user_info['alc'] == 2)): ?>
     <br><button onclick="NewWorld();">New World?</button>
     <?php endif; ?>
     </div>
@@ -711,6 +870,26 @@ function NewWorld() {
     el.style.backgroundRepeat     = 'no-repeat';
     el.style.backgroundAttachment = 'fixed';
   });
+}
+
+/* =========================================================
+   字段折叠：题号旁边的按钮切换 body 的显示
+   ========================================================= */
+function toggleField(key) {
+  var body = document.getElementById('ft_body_' + key);
+  var btn  = document.getElementById('ft_but_'  + key);
+  var box  = document.getElementById('fb_'      + key);
+  if (!body || !btn) return;
+
+  if (body.style.display === 'none') {
+    body.style.display = 'block';
+    btn.textContent = '折叠';
+    if (box) box.classList.add('expanded');
+  } else {
+    body.style.display = 'none';
+    btn.textContent = '展开';
+    if (box) box.classList.remove('expanded');
+  }
 }
 
 (function () {
