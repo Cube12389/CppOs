@@ -44,9 +44,76 @@ function resolve_user_color($alc, $num) {
 }
 /* ============================================================ */
 
+/* ============================================================
+ * DeepSeek AI 助手（本地 llama-server）配置与工具函数
+ * ============================================================ */
+$LLM_BASE_URL   = 'http://127.0.0.1:8080';
+$LLM_MODEL      = 'deepseek-r1';
+$LLM_TIMEOUT    = 180;
+$LLM_MAX_TOKENS = 512;
+
+function extract_final_answer($text) {
+    $text = (string)$text;
+    $text = preg_replace('/<think>[\s\S]*?<\/think>\s*/i', '', $text);
+    $text = preg_replace('/◀think▶[\s\S]*?◀\/think▶\s*/i', '', $text);
+    $t = trim($text);
+    return $t !== '' ? $t : $text;
+}
+
+function call_llm($prompt, $base_url, $model, $timeout, $max_tokens) {
+    $payload = [
+        'model'       => $model,
+        'messages'    => [['role' => 'user', 'content' => $prompt]],
+        'stream'      => false,
+        'temperature' => 0.6,
+        'max_tokens'  => (int)$max_tokens,
+    ];
+    $json = json_encode($payload, JSON_UNESCAPED_UNICODE);
+
+    $ch = curl_init($base_url . '/v1/chat/completions');
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $json,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => (int)$timeout,
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+    ]);
+    $resp = curl_exec($ch);
+    $err  = curl_error($ch);
+    curl_close($ch);
+
+    if ($resp === false) {
+        return ['ok' => false, 'error' => '无法连接本地 AI 服务（请确认已启动 llama-server）：' . $err];
+    }
+    $data = json_decode($resp, true);
+    if (!is_array($data)) {
+        return ['ok' => false, 'error' => 'AI 服务返回异常：' . mb_substr((string)$resp, 0, 200)];
+    }
+    if (isset($data['error'])) {
+        $e = $data['error'];
+        $emsg = is_array($e) && isset($e['message']) ? $e['message'] : (is_string($e) ? $e : '未知错误');
+        return ['ok' => false, 'error' => 'AI 服务错误：' . $emsg];
+    }
+    $msg     = isset($data['choices'][0]['message']) ? $data['choices'][0]['message'] : [];
+    $content = isset($msg['content']) ? (string)$msg['content'] : '';
+    if ($content === '' && isset($msg['reasoning_content'])) {
+        $content = (string)$msg['reasoning_content'];
+    }
+    $content = extract_final_answer($content);
+    if ($content === '') {
+        return ['ok' => false, 'error' => 'AI 返回内容为空'];
+    }
+    return ['ok' => true, 'content' => $content];
+}
+/* ============================================================ */
+
 $is_logged_in = false;
 $user_info    = null;
 $msg          = '';
+$ai_prompt    = '';
+$ai_reply     = '';
+$ai_error     = '';
+$ai_remaining = null;
 
 /* ---------------- 1. 用 cookie 自动登录 ---------------- */
 if (!empty($_COOKIE['login_cookie'])) {
@@ -74,6 +141,39 @@ if (!empty($_COOKIE['login_cookie'])) {
         } else {
             $stmt->close();
             setcookie("login_cookie", "", time() - 3600, "/", "", false, true);
+        }
+    }
+}
+
+/* ---------------- AI 配置加载（登录后一次） ---------------- */
+$ai_config = ['rate_limit' => 3, 'window_minutes' => 60, 'enabled' => 1];
+$ai_remaining = null;
+if ($is_logged_in) {
+    $ai_cfg_stmt = $conn->prepare("SELECT `rate_limit`, `window_minutes`, `enabled` FROM `ai_config` WHERE `id` = 1");
+    if ($ai_cfg_stmt) {
+        $ai_cfg_stmt->execute();
+        $ai_cr = $ai_cfg_stmt->get_result()->fetch_assoc();
+        $ai_cfg_stmt->close();
+        if ($ai_cr) {
+            $ai_config = [
+                'rate_limit'     => (int)$ai_cr['rate_limit'],
+                'window_minutes' => (int)$ai_cr['window_minutes'],
+                'enabled'        => (int)$ai_cr['enabled'],
+            ];
+        }
+    }
+    // 普通用户（非管理员）计算剩余次数
+    if ((int)$user_info['alc'] !== 2 && $ai_config['enabled'] === 1) {
+        $ai_uid = (int)$user_info['uid'];
+        $ai_win = (int)$ai_config['window_minutes'];
+        $ai_cnt_stmt = $conn->prepare("SELECT COUNT(*) AS c FROM `ai_usage` WHERE `uid` = ? AND `used_at` >= DATE_SUB(NOW(), INTERVAL ? MINUTE)");
+        if ($ai_cnt_stmt) {
+            $ai_cnt_stmt->bind_param("ii", $ai_uid, $ai_win);
+            $ai_cnt_stmt->execute();
+            $ai_crow = $ai_cnt_stmt->get_result()->fetch_assoc();
+            $ai_cnt_stmt->close();
+            $used = (int)($ai_crow['c'] ?? 0);
+            $ai_remaining = (int)$ai_config['rate_limit'] - $used;
         }
     }
 }
@@ -387,14 +487,21 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 if ($exists) {
                     $msg = "<div class='alert alert-error'>UID " . $new_uid . " 已存在，不能重复新建</div>";
                 } else {
+                    /* ★ 把当前管理员的 uid 写入 cook.UserUid 作为创建者 */
+                    $creator_uid = (int)$user_info['uid'];
+
                     $stmt = $conn->prepare(
                         "INSERT INTO `cook`
-                           (`uid`, `name`, `A`, `B`, `C`, `D`, `E`, `F`, `G`, `H`, `I`, `J`, `K`, `L`, `M`, `N`, `O`, `P`, `Q`, `R`, `S`, `T`, `U`, `V`, `W`, `X`, `Y`, `Z`)
+                           (`uid`, `name`, `UserUid`,
+                            `A`, `B`, `C`, `D`, `E`, `F`, `G`, `H`, `I`, `J`, `K`,
+                            `L`, `M`, `N`, `O`, `P`, `Q`, `R`, `S`, `T`, `U`, `V`, `W`, `X`, `Y`, `Z`)
                          VALUES
-                           (?, ?, 'none','none','none','none','none','none','none','none','none','none','none','none','none','none','none','none','none','none','none','none','none','none','none','none','none','none')"
+                           (?, ?, ?,
+                            'none','none','none','none','none','none','none','none','none','none','none',
+                            'none','none','none','none','none','none','none','none','none','none','none','none','none','none','none')"
                     );
                     if ($stmt) {
-                        $stmt->bind_param("is", $new_uid, $new_name);
+                        $stmt->bind_param("isi", $new_uid, $new_name, $creator_uid);
                         if ($stmt->execute()) {
                             $msg = "<div class='alert alert-success'>新建 cook 成功：UID=" . $new_uid . "</div>";
                         } else {
@@ -408,6 +515,46 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             }
         } else {
             $msg = "<div class='alert alert-error'>无权限新建 cook</div>";
+        }
+    }
+
+    /* ---------- AI 问答 ---------- */
+    else if ($action === 'ai_chat') {
+        if (!$is_logged_in) {
+            $ai_error = '请先登录后再使用 AI 助手';
+        } else if ((int)$user_info['alc'] < 1) {
+            $ai_error = '你的账号无权限使用 AI 助手';
+        } else if ($ai_config['enabled'] !== 1) {
+            $ai_error = 'AI 助手当前已停用';
+        } else {
+            $prompt = trim($_POST['prompt'] ?? '');
+            if ($prompt === '') {
+                $ai_error = '请输入你要问的问题';
+            } else {
+                $is_admin = ((int)$user_info['alc'] === 2);
+                if (!$is_admin && $ai_remaining !== null && $ai_remaining <= 0) {
+                    $ai_error = '已达每小时 ' . (int)$ai_config['rate_limit'] . ' 次上限，请稍后再试';
+                } else {
+                    set_time_limit(0); // 允许长时间等待模型生成
+                    $result = call_llm($prompt, $LLM_BASE_URL, $LLM_MODEL, $LLM_TIMEOUT, $LLM_MAX_TOKENS);
+                    if ($result['ok']) {
+                        $ai_prompt = $prompt;
+                        $ai_reply  = $result['content'];
+                        $ins = $conn->prepare("INSERT INTO `ai_usage` (`uid`, `used_at`) VALUES (?, NOW())");
+                        if ($ins) {
+                            $u = (int)$user_info['uid'];
+                            $ins->bind_param("i", $u);
+                            $ins->execute();
+                            $ins->close();
+                        }
+                        if ($ai_remaining !== null) {
+                            $ai_remaining = max(0, $ai_remaining - 1);
+                        }
+                    } else {
+                        $ai_error = $result['error'];
+                    }
+                }
+            }
         }
     }
 }
@@ -445,7 +592,6 @@ if ($is_logged_in) {
         :root {
             --bg: #eef2f8;
 
-            /* 玻璃层参数 */
             --glass-bg: rgba(255, 255, 255, 0.55);
             --glass-bg-strong: rgba(255, 255, 255, 0.72);
             --glass-bg-soft: rgba(255, 255, 255, 0.40);
@@ -508,7 +654,6 @@ if ($is_logged_in) {
             --tok-com: #6e7781;
             --tok-pre: #8250df;
 
-            /* 动效时长 */
             --dur-fast: .18s;
             --dur: .32s;
             --dur-slow: .5s;
@@ -617,7 +762,7 @@ if ($is_logged_in) {
         a { color: var(--primary); text-decoration: none; transition: color var(--dur-fast) var(--ease); }
         a:hover { color: var(--primary-hover); text-decoration: underline; }
 
-        /* ================= 顶部导航栏（玻璃） ================= */
+        /* ================= 顶部导航栏 ================= */
         .navbar {
             background: var(--glass-bg-strong);
             backdrop-filter: saturate(180%) blur(22px);
@@ -658,14 +803,13 @@ if ($is_logged_in) {
         .navbar-user form { display: inline; margin: 0; }
 
         .navbar-user .btn-logout,
-        .navbar-user .btn-theme {
+        .navbar-user .btn-theme,
+        .navbar-user .btn-compat {
             font-size: 12px;
             line-height: 1;
             padding: 5px 11px;
             color: var(--text-soft);
             background: var(--glass-bg-soft);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
             border: 1px solid var(--glass-border-soft);
             border-radius: 8px;
             cursor: pointer;
@@ -683,20 +827,23 @@ if ($is_logged_in) {
             transform: translateY(-1px);
             box-shadow: 0 4px 12px rgba(207, 34, 46, 0.15);
         }
-        .navbar-user .btn-theme {
+        .navbar-user .btn-theme,
+        .navbar-user .btn-compat {
             font-size: 14px;
             padding: 4px 9px;
             min-width: 34px;
             text-align: center;
         }
-        .navbar-user .btn-theme:hover {
+        .navbar-user .btn-theme:hover,
+        .navbar-user .btn-compat:hover {
             color: var(--primary);
             border-color: var(--primary);
             background: var(--hover-bg);
             transform: translateY(-1px) scale(1.05);
             box-shadow: 0 4px 12px rgba(52, 152, 219, 0.18);
         }
-        .navbar-user .btn-theme:active {
+        .navbar-user .btn-theme:active,
+        .navbar-user .btn-compat:active {
             transform: translateY(0) scale(0.96);
         }
 
@@ -709,7 +856,7 @@ if ($is_logged_in) {
             z-index: 1;
         }
 
-        /* ================= 卡片（玻璃） ================= */
+        /* ================= 卡片 ================= */
         .card {
             background: var(--card-bg);
             backdrop-filter: saturate(180%) blur(18px);
@@ -753,7 +900,7 @@ if ($is_logged_in) {
             font-weight: 400;
         }
 
-        /* ================= 表单（玻璃） ================= */
+        /* ================= 表单 ================= */
         label {
             display: inline-block;
             color: var(--text-soft);
@@ -769,8 +916,6 @@ if ($is_logged_in) {
             font-size: 13px;
             color: var(--text);
             background: var(--input-bg);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
             border: 1px solid var(--input-border);
             border-radius: 10px;
             padding: 8px 12px;
@@ -802,7 +947,7 @@ if ($is_logged_in) {
         }
         select { padding: 7px 10px; }
 
-        /* ================= 按钮（玻璃 + 弹簧） ================= */
+        /* ================= 按钮 ================= */
         button, .btn {
             font-family: inherit;
             font-size: 13px;
@@ -841,8 +986,6 @@ if ($is_logged_in) {
         button.btn-ghost {
             color: var(--text-soft);
             background: var(--glass-bg-soft);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
             border-color: var(--glass-border-soft);
             box-shadow:
                 0 2px 8px rgba(31, 38, 135, 0.06),
@@ -878,15 +1021,13 @@ if ($is_logged_in) {
             transform: translateY(-1px);
         }
 
-        /* ================= 提示条（玻璃） ================= */
+        /* ================= 提示条 ================= */
         .alert {
             border-radius: 12px;
             padding: 12px 16px;
             margin: 14px 0;
             font-size: 13px;
             border: 1px solid transparent;
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
             animation: alertIn var(--dur) var(--ease-spring) both;
         }
         @keyframes alertIn {
@@ -923,8 +1064,6 @@ if ($is_logged_in) {
         }
         .rank-table thead th {
             background: var(--glass-bg-soft);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
             color: var(--text-muted);
             font-weight: 500;
             font-size: 12px;
@@ -983,7 +1122,7 @@ if ($is_logged_in) {
             font-family: Consolas, Monaco, "Courier New", monospace;
         }
 
-        /* ================= Cook 列表（玻璃） ================= */
+        /* ================= Cook 列表 ================= */
         .cook-item {
             background: var(--glass-bg);
             backdrop-filter: saturate(160%) blur(16px);
@@ -992,6 +1131,8 @@ if ($is_logged_in) {
             border-radius: 14px;
             margin-bottom: 14px;
             overflow: hidden;
+            content-visibility: auto;
+            contain-intrinsic-size: auto 200px;
             box-shadow: var(--glass-shadow);
             transition:
                 background-color var(--dur) var(--ease),
@@ -1017,6 +1158,11 @@ if ($is_logged_in) {
             font-size: 14px;
             font-weight: 600;
             color: var(--text);
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 0;
+            min-width: 0;
         }
         .cook-head-title .idx {
             display: inline-block;
@@ -1025,6 +1171,40 @@ if ($is_logged_in) {
             font-family: Consolas, Monaco, "Courier New", monospace;
             margin-right: 6px;
         }
+        .cook-creator {
+            display: inline-flex;
+            align-items: center;
+            margin-left: 10px;
+            font-size: 12px;
+            font-weight: 400;
+            color: var(--text-muted);
+            letter-spacing: 0;
+            white-space: nowrap;
+        }
+        .cook-creator .creator-label {
+            color: var(--text-faint);
+            margin-right: 4px;
+        }
+        .cook-creator .creator-name {
+            font-weight: 500;
+        }
+        .cook-creator .creator-badge {
+            display: inline-block;
+            font-size: 10px;
+            font-weight: 500;
+            line-height: 1.4;
+            color: #ffffff;
+            padding: 0 5px;
+            border-radius: 4px;
+            margin-left: 4px;
+            letter-spacing: 0;
+        }
+        .cook-creator .creator-missing {
+            color: var(--text-faint);
+            font-family: Consolas, Monaco, "Courier New", monospace;
+            font-size: 11px;
+        }
+
         .cook-body {
             padding: 12px 18px 6px 18px;
             max-height: 12000px;
@@ -1039,15 +1219,13 @@ if ($is_logged_in) {
             opacity: 0;
         }
 
-        /* ================= 字段折叠（玻璃 + 动效） ================= */
+        /* ================= 字段折叠 ================= */
         .field-block {
             border: 1px solid var(--glass-border-soft);
             border-radius: 12px;
             margin-bottom: 10px;
             overflow: hidden;
             background: var(--glass-bg-soft);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
             transition:
                 background-color var(--dur) var(--ease),
                 border-color var(--dur) var(--ease),
@@ -1101,8 +1279,6 @@ if ($is_logged_in) {
             padding: 5px 14px;
             color: var(--text-soft);
             background: var(--glass-bg-soft);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
             border: 1px solid var(--glass-border-soft);
             border-radius: 8px;
             transition:
@@ -1121,7 +1297,6 @@ if ($is_logged_in) {
         }
         .field-toggle:active { transform: translateY(0) scale(0.95); }
 
-        /* ★ 展开/折叠动画（用 max-height + opacity 实现平滑过渡） */
         .field-body {
             padding: 0 14px;
             max-height: 0;
@@ -1143,8 +1318,6 @@ if ($is_logged_in) {
             position: relative;
             margin: 4px 0 12px 0;
             background: var(--code-bg);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
             border: 1px solid var(--glass-border-soft);
             border-radius: 12px;
             overflow: hidden;
@@ -1188,8 +1361,6 @@ if ($is_logged_in) {
             line-height: 1.4;
             color: var(--text-soft);
             background: var(--glass-bg-soft);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
             border: 1px solid var(--glass-border-soft);
             border-radius: 8px;
             padding: 2px 9px;
@@ -1203,8 +1374,6 @@ if ($is_logged_in) {
             padding: 5px 12px;
             color: var(--text-soft);
             background: var(--glass-bg-soft);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
             border: 1px solid var(--glass-border-soft);
             border-radius: 8px;
             flex-shrink: 0;
@@ -1252,7 +1421,7 @@ if ($is_logged_in) {
         .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
         .muted { color: var(--text-muted); font-size: 12px; }
 
-        /* ================= 滚动条（iOS 风格） ================= */
+        /* ================= 滚动条 ================= */
         ::-webkit-scrollbar { width: 10px; height: 10px; }
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb {
@@ -1274,19 +1443,342 @@ if ($is_logged_in) {
             background-clip: content-box;
         }
 
-        /* ================= 无障碍：尊重系统减弱动效偏好 ================= */
         @media (prefers-reduced-motion: reduce) {
             * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
         }
+
+        /* ============================================================
+         * ★★ 兼容模式（无特效）
+         *
+         * 关闭毛玻璃、渐变、彩色背景、阴影、动画，
+         * 改用纯色分层 + 清晰 1px 边框，界面依旧整洁美观。
+         * 触发方式：在 <html> 上添加 .compat 类。
+         * ============================================================ */
+
+        /* 1) 覆盖玻璃相关变量为纯色 */
+        html.compat {
+            --glass-bg:          #ffffff;
+            --glass-bg-strong:   #ffffff;
+            --glass-bg-soft:     #f2f2f7;
+            --glass-border:      #d1d1d6;
+            --glass-border-soft: #e5e5ea;
+            --glass-shadow:      0 0 0 rgba(0,0,0,0);
+            --glass-shadow-hover: 0 0 0 rgba(0,0,0,0);
+
+            --card-bg:     #ffffff;
+            --card-border: #d1d1d6;
+            --card-shadow: 0 0 0 rgba(0,0,0,0);
+
+            --divider:        #e5e5ea;
+            --divider-strong: #d1d1d6;
+
+            --input-bg:     #ffffff;
+            --input-border: #c7c7cc;
+
+            --hover-bg:        #eaf2fd;
+            --hover-bg-strong: #d7e8fb;
+            --row-hover:       #f2f2f7;
+
+            --code-bg:       #f7f7f8;
+            --code-bar-bg:   #eeeef0;
+            --field-head-bg: #f2f2f7;
+
+            --alert-error-bg:     #fdecea;
+            --alert-error-border: #f5b7b1;
+            --alert-success-bg:     #eaf9ee;
+            --alert-success-border: #b7e5c0;
+        }
+        html.compat[data-theme="dark"] {
+            --glass-bg:          #2c2c2e;
+            --glass-bg-strong:   #2c2c2e;
+            --glass-bg-soft:     #3a3a3c;
+            --glass-border:      #48484a;
+            --glass-border-soft: #3a3a3c;
+
+            --card-bg:     #2c2c2e;
+            --card-border: #48484a;
+
+            --divider:        #3a3a3c;
+            --divider-strong: #48484a;
+
+            --input-bg:     #1c1c1e;
+            --input-border: #48484a;
+
+            --hover-bg:        rgba(74, 168, 232, 0.18);
+            --hover-bg-strong: rgba(74, 168, 232, 0.28);
+            --row-hover:       #3a3a3c;
+
+            --code-bg:       #1c1c1e;
+            --code-bar-bg:   #2a2a2c;
+            --field-head-bg: #3a3a3c;
+
+            --alert-error-bg:     #3a1e1e;
+            --alert-error-border: #6e2e2e;
+            --alert-success-bg:     #1a2e1e;
+            --alert-success-border: #2e5e3a;
+        }
+
+        /* 2) body：纯色背景，无径向渐变 */
+        html.compat body {
+            background: #f5f5f7;
+            background-image: none;
+        }
+        html.compat[data-theme="dark"] body {
+            background: #1c1c1e;
+            background-image: none;
+        }
+
+        /* 3) 全局禁用毛玻璃 */
+        html.compat .navbar,
+        html.compat .card,
+        html.compat .cook-item,
+        html.compat .field-block,
+        html.compat .code-block,
+        html.compat .code-contributor,
+        html.compat .navbar-user .btn-logout,
+        html.compat .navbar-user .btn-theme,
+        html.compat .navbar-user .btn-compat,
+        html.compat .field-toggle,
+        html.compat .copy-btn,
+        html.compat button,
+        html.compat .btn {
+            backdrop-filter: none !important;
+            -webkit-backdrop-filter: none !important;
+        }
+
+        /* 4) 全局禁用动画与过渡（等效于瞬时切换） */
+        html.compat *,
+        html.compat *::before,
+        html.compat *::after {
+            animation-duration: 0.001ms !important;
+            animation-delay: 0ms !important;
+            transition-duration: 0.001ms !important;
+            transition-delay: 0ms !important;
+        }
+
+        /* 5) 导航栏：纯色 + 底边框 */
+        html.compat .navbar {
+            background: #ffffff;
+            border-bottom: 1px solid #d1d1d6;
+            box-shadow: none;
+        }
+        html.compat[data-theme="dark"] .navbar {
+            background: #2c2c2e;
+            border-bottom-color: #3a3a3c;
+        }
+
+        /* 6) 卡片：纯色 + 边框 + 无悬浮位移 */
+        html.compat .card {
+            background: #ffffff;
+            border: 1px solid #d1d1d6;
+            box-shadow: none;
+            transform: none !important;
+        }
+        html.compat[data-theme="dark"] .card {
+            background: #2c2c2e;
+            border-color: #48484a;
+        }
+        html.compat .card:hover {
+            box-shadow: none;
+            transform: none !important;
+        }
+
+        /* 7) cook 卡片 */
+        html.compat .cook-item {
+            background: #ffffff;
+            border: 1px solid #d1d1d6;
+            box-shadow: none;
+            transform: none !important;
+            /* content-visibility 在老浏览器上支持差，兼容模式关掉更稳 */
+            content-visibility: visible;
+        }
+        html.compat[data-theme="dark"] .cook-item {
+            background: #2c2c2e;
+            border-color: #48484a;
+        }
+        html.compat .cook-item:hover {
+            box-shadow: none;
+            transform: none !important;
+        }
+        html.compat .cook-head {
+            background: #f7f7f8;
+        }
+        html.compat[data-theme="dark"] .cook-head {
+            background: #3a3a3c;
+        }
+
+        /* 8) 字段块 */
+        html.compat .field-block {
+            background: #ffffff;
+            border: 1px solid #e5e5ea;
+        }
+        html.compat[data-theme="dark"] .field-block {
+            background: #2c2c2e;
+            border-color: #48484a;
+        }
+        html.compat .field-block:hover {
+            box-shadow: none;
+        }
+        html.compat .field-head {
+            background: #f7f7f8;
+        }
+        html.compat[data-theme="dark"] .field-head {
+            background: #3a3a3c;
+        }
+
+        /* 9) 代码块 */
+        html.compat .code-block {
+            background: #f7f7f8;
+            border: 1px solid #e5e5ea;
+            box-shadow: none;
+        }
+        html.compat[data-theme="dark"] .code-block {
+            background: #1c1c1e;
+            border-color: #3a3a3c;
+        }
+        html.compat .code-block:hover {
+            box-shadow: none;
+        }
+        html.compat .code-bar {
+            background: #eeeef0;
+        }
+        html.compat[data-theme="dark"] .code-bar {
+            background: #2a2a2c;
+        }
+
+        /* 10) 按钮：纯色，无渐变、无阴影、无位移 */
+        html.compat button,
+        html.compat .btn {
+            background: var(--primary);
+            border-color: var(--primary);
+            box-shadow: none;
+        }
+        html.compat button:hover,
+        html.compat .btn:hover {
+            background: var(--primary-hover);
+            border-color: var(--primary-hover);
+            box-shadow: none;
+            transform: none;
+        }
+        html.compat button:active,
+        html.compat .btn:active {
+            background: var(--primary-active);
+            border-color: var(--primary-active);
+            transform: none;
+        }
+
+        html.compat button.btn-ghost,
+        html.compat .btn-ghost {
+            background: #f2f2f7;
+            border-color: #d1d1d6;
+            color: var(--text-soft);
+            box-shadow: none;
+        }
+        html.compat[data-theme="dark"] button.btn-ghost,
+        html.compat[data-theme="dark"] .btn-ghost {
+            background: #3a3a3c;
+            border-color: #48484a;
+        }
+        html.compat button.btn-ghost:hover,
+        html.compat .btn-ghost:hover {
+            background: #eaf2fd;
+            color: var(--primary);
+            border-color: var(--primary);
+            box-shadow: none;
+            transform: none;
+        }
+        html.compat[data-theme="dark"] button.btn-ghost:hover,
+        html.compat[data-theme="dark"] .btn-ghost:hover {
+            background: rgba(74, 168, 232, 0.18);
+        }
+
+        /* 11) 工具栏按钮 */
+        html.compat .navbar-user .btn-logout,
+        html.compat .navbar-user .btn-theme,
+        html.compat .navbar-user .btn-compat {
+            background: #f2f2f7;
+            border-color: #d1d1d6;
+            box-shadow: none;
+            transform: none;
+        }
+        html.compat[data-theme="dark"] .navbar-user .btn-logout,
+        html.compat[data-theme="dark"] .navbar-user .btn-theme,
+        html.compat[data-theme="dark"] .navbar-user .btn-compat {
+            background: #3a3a3c;
+            border-color: #48484a;
+        }
+        html.compat .navbar-user .btn-logout:hover,
+        html.compat .navbar-user .btn-theme:hover,
+        html.compat .navbar-user .btn-compat:hover {
+            box-shadow: none;
+            transform: none;
+        }
+
+        /* 12) 输入框：去掉聚焦上浮，保留一圈清晰描边 */
+        html.compat input:focus,
+        html.compat textarea:focus,
+        html.compat select:focus {
+            transform: none;
+            box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.35);
+        }
+        html.compat[data-theme="dark"] input:focus,
+        html.compat[data-theme="dark"] textarea:focus,
+        html.compat[data-theme="dark"] select:focus {
+            box-shadow: 0 0 0 2px rgba(74, 168, 232, 0.45);
+        }
+
+        /* 13) 提示条：无阴影 */
+        html.compat .alert {
+            box-shadow: none;
+        }
+
+        /* 14) 表头：纯色底 */
+        html.compat .rank-table thead th {
+            background: #f2f2f7;
+        }
+        html.compat[data-theme="dark"] .rank-table thead th {
+            background: #3a3a3c;
+        }
+
+        /* 15) 滚动条简化 */
+        html.compat ::-webkit-scrollbar-thumb {
+            background: #c7c7cc;
+            border: none;
+            background-clip: border-box;
+        }
+        html.compat[data-theme="dark"] ::-webkit-scrollbar-thumb {
+            background: #48484a;
+            background-clip: border-box;
+        }
+        html.compat ::-webkit-scrollbar-thumb:hover {
+            background: #a1a1a6;
+        }
+        html.compat[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+            background: #5a5a5c;
+        }
     </style>
 
-    <!-- ★ 在 <body> 之前应用已保存的主题，避免闪烁 -->
+    <!-- ★ 在 <body> 之前应用已保存的主题与兼容模式，避免闪烁 -->
     <script>
     (function () {
         try {
+            /* 主题 */
             var t = localStorage.getItem('theme');
             if (t === 'dark' || t === 'light') {
                 document.documentElement.setAttribute('data-theme', t);
+            } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                document.documentElement.setAttribute('data-theme', 'dark');
+            }
+
+            /* 兼容模式 */
+            var c = localStorage.getItem('compat');
+            if (c === '1') {
+                document.documentElement.classList.add('compat');
+            } else if (c === null) {
+                /* 用户未手动设置过时，若系统偏好减弱动效则自动开启兼容模式 */
+                if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                    document.documentElement.classList.add('compat');
+                }
             }
         } catch (e) {}
     })();
@@ -1307,7 +1799,12 @@ if ($is_logged_in) {
         </strong>
         <span style="color: var(--text-faint);">UID <?php echo (int)$user_info['uid']; ?></span>
 
-        <!-- ★ 主题切换 -->
+        <!-- 兼容模式切换 -->
+        <button type="button" class="btn-compat" id="compat-toggle-btn" onclick="toggleCompat();" title="切换兼容模式">
+          <span id="compat-icon">✨</span>
+        </button>
+
+        <!-- 主题切换 -->
         <button type="button" class="btn-theme" id="theme-toggle-btn" onclick="toggleTheme();" title="切换浅色 / 深色模式">
           <span id="theme-icon">🌙</span>
         </button>
@@ -1318,6 +1815,9 @@ if ($is_logged_in) {
         </form>
       <?php else: ?>
         <span>未登录</span>
+        <button type="button" class="btn-compat" id="compat-toggle-btn" onclick="toggleCompat();" title="切换兼容模式">
+          <span id="compat-icon">✨</span>
+        </button>
         <button type="button" class="btn-theme" id="theme-toggle-btn" onclick="toggleTheme();" title="切换浅色 / 深色模式">
           <span id="theme-icon">🌙</span>
         </button>
@@ -1328,7 +1828,6 @@ if ($is_logged_in) {
 
 <div class="container">
 
-  <!-- ============ 消息 ============ -->
   <?php echo $msg; ?>
 
   <!-- ============ 登录 / 注册 ============ -->
@@ -1417,6 +1916,49 @@ if ($is_logged_in) {
     </div>
   <?php endif; ?>
 
+  <!-- ============ AI 助手 ============ -->
+  <?php if ($is_logged_in && ((int)$user_info['alc'] === 1 || (int)$user_info['alc'] === 2)): ?>
+    <div class="card" id="ai-chat">
+      <div class="card-title">
+        <span>AI 助手（DeepSeek-R1）</span>
+        <span class="sub">
+          <?php if ((int)$user_info['alc'] === 2): ?>
+            管理员 · 不限次数
+          <?php else: ?>
+            普通用户 · 每小时 <?php echo (int)$ai_config['rate_limit']; ?> 次<?php echo ($ai_remaining !== null ? ' · 剩余 ' . max(0, $ai_remaining) . ' 次' : ''); ?>
+          <?php endif; ?>
+        </span>
+      </div>
+      <form method="POST">
+        <input type="hidden" name="action" value="ai_chat">
+        <div style="margin-bottom: 12px;">
+          <label>向 AI 提问</label>
+          <textarea name="prompt" rows="3" required placeholder="输入你的问题，例如：用 C++ 写一个快速排序"></textarea>
+        </div>
+        <button type="submit">发送</button>
+        <span class="muted" style="margin-left:10px;">生成可能需要几十秒，请耐心等待</span>
+      </form>
+
+      <?php if ($ai_error !== ''): ?>
+        <div class="alert alert-error" style="margin-top:14px;"><?php echo htmlspecialchars($ai_error); ?></div>
+      <?php endif; ?>
+
+      <?php if ($ai_prompt !== ''): ?>
+        <div style="margin-top:16px;">
+          <div class="muted">你问：</div>
+          <div style="margin:6px 0 10px; padding:10px 14px; background: var(--input-bg); border:1px solid var(--input-border); border-radius:10px;"><?php echo nl2br(htmlspecialchars($ai_prompt)); ?></div>
+        </div>
+      <?php endif; ?>
+
+      <?php if ($ai_reply !== ''): ?>
+        <div style="margin-top:16px;">
+          <div class="muted">AI 回答：</div>
+          <div style="margin:6px 0 0; padding:14px 16px; background: var(--code-bg); border:1px solid var(--glass-border-soft); border-radius:10px; white-space: pre-wrap; word-break: break-word; font-size:13.5px; line-height:1.7;"><?php echo htmlspecialchars($ai_reply); ?></div>
+        </div>
+      <?php endif; ?>
+    </div>
+  <?php endif; ?>
+
   <!-- ============ 修改密码 ============ -->
   <?php if ($is_logged_in): ?>
   <div class="card">
@@ -1453,24 +1995,56 @@ if ($is_logged_in) {
               echo "<div class='card'><a href='http://192.168.21.229/phpMyAdmin4.8.5/'>→ 管理员界面（phpMyAdmin）</a></div>";
           }
 
-          $user_cache = [];
+          /* 一次性取出所有用户，避免每个贡献者都查一次库（N+1） */
+          $all_users = [];
+          $user_stmt = $conn->query("SELECT `uid`, `name`, `calling`, `color`, `alc`, `num` FROM `user`");
+          if ($user_stmt) {
+              while ($u = $user_stmt->fetch_assoc()) {
+                  $all_users[(int)$u['uid']] = $u;
+              }
+          }
 
-          $stmt1 = $conn->prepare("SELECT * FROM `cook`");
-          if ($stmt1) {
-              $stmt1->bind_param("i", $i1);
-              $stmt1->execute();
-              $result1 = $stmt1->get_result();
-              for ($i1 = 1; $i1 <= $result1->num_rows; $i1++) {
-            $stmt = $conn->prepare("SELECT * FROM `cook` WHERE `uid` = ?");
-            if ($stmt) {
-              $stmt->bind_param("i", $i1);
-              $stmt->execute();
-              $result = $stmt->get_result();
+          /* 一次性取出全部 cook 后直接遍历 */
+          $cook_stmt = $conn->query("SELECT * FROM `cook` ORDER BY `uid` ASC");
+          if ($cook_stmt) {
+              $i1 = 0;
+              while ($row = $cook_stmt->fetch_assoc()) {
+                  $i1++;
 
-              if ($row = $result->fetch_assoc()) {
+                $creator_uid = isset($row['UserUid']) ? (int)$row['UserUid'] : 0;
+                $creator     = ($creator_uid > 0 && isset($all_users[$creator_uid]))
+                               ? $all_users[$creator_uid]
+                               : null;
+
                 echo "<div class='cook-item'>";
                 echo "  <div class='cook-head'>";
-                echo "    <div class='cook-head-title'><span class='idx'>#" . $i1 . "</span>" . htmlspecialchars($row['name']) . "</div>";
+                echo "    <div class='cook-head-title'><span class='idx'>#" . $i1 . "</span>" . htmlspecialchars($row['name']);
+
+                if ($creator) {
+                    $cc = resolve_user_color($creator['alc'] ?? 0, $creator['num'] ?? 0);
+                    echo "<span class='cook-creator'>";
+                    echo "  <span class='creator-label'>创建者</span>";
+                    echo "  <span class='creator-name' style='color: " . htmlspecialchars($cc) . "'>"
+                       . htmlspecialchars($creator['name']) . "</span>";
+                    if ($creator['calling'] !== 'none' && $creator['calling'] !== '') {
+                        echo "<span class='creator-badge' style='background-color: " . htmlspecialchars($cc) . "'>"
+                           . htmlspecialchars($creator['calling']) . "</span>";
+                    }
+                    echo "  <span class='rank-uid'>UID " . (int)$creator_uid . "</span>";
+                    echo "</span>";
+                } else if ($creator_uid > 0) {
+                    echo "<span class='cook-creator'>";
+                    echo "  <span class='creator-label'>创建者</span>";
+                    echo "  <span class='creator-missing'>UID " . (int)$creator_uid . "（已注销）</span>";
+                    echo "</span>";
+                } else {
+                    echo "<span class='cook-creator'>";
+                    echo "  <span class='creator-label'>创建者</span>";
+                    echo "  <span class='creator-missing'>未知</span>";
+                    echo "</span>";
+                }
+
+                echo "    </div>";
                 echo "    <button type='button' class='btn-ghost' id='but$i1' onclick='ks($i1);'>显示</button>";
                 echo "  </div>";
                 echo "  <div class='cook-body collapsed' id='$i1'>";
@@ -1526,21 +2100,7 @@ if ($is_logged_in) {
                     echo "  <div class='field-body' id='ft_body_" . $field_key . "'>";
 
                     if ($contributor !== null) {
-                        $cu = null;
-                        if (array_key_exists($contributor, $user_cache)) {
-                            $cu = $user_cache[$contributor];
-                        } else {
-                            $cu_stmt = $conn->prepare("SELECT `name`, `calling`, `color`, `alc`, `num` FROM `user` WHERE `uid` = ?");
-                            if ($cu_stmt) {
-                                $cu_uid = intval($contributor);
-                                $cu_stmt->bind_param("i", $cu_uid);
-                                $cu_stmt->execute();
-                                $cu_res = $cu_stmt->get_result();
-                                $cu = $cu_res->fetch_assoc();
-                                $cu_stmt->close();
-                            }
-                            $user_cache[$contributor] = $cu;
-                        }
+                        $cu = isset($all_users[(int)$contributor]) ? $all_users[(int)$contributor] : null;
 
                         if ($cu) {
                             $cu_color = resolve_user_color($cu['alc'] ?? 0, $cu['num'] ?? 0);
@@ -1568,14 +2128,9 @@ if ($is_logged_in) {
 
                 echo "  </div>";
                 echo "</div>";
-              } else {
-                  echo "<div class='card'><span class='muted'>#" . $i1 . " 暂无数据</span></div>";
               }
-              $stmt->close();
-            } else {
+          } else {
               echo "<div class='card'>SQL 准备失败: " . htmlspecialchars($conn->error) . "</div>";
-            }
-          }
           }
 
         } else {
@@ -1713,7 +2268,6 @@ if ($is_logged_in) {
   </div>
   <?php endif; ?>
 
-  <!-- ============ New World ============ -->
   <?php if ($is_logged_in && ($user_info['alc'] == 1 || $user_info['alc'] == 2)): ?>
     <div style="text-align:center; margin: 20px 0;">
       <button type="button" class="btn-ghost" onclick="NewWorld();">New World?</button>
@@ -1739,15 +2293,40 @@ function applyThemeIcon() {
 function toggleTheme() {
   var html = document.documentElement;
   var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-
-  /* 切换时短暂添加一个 class，让背景色过渡更自然 */
   document.body.style.transition = 'background-color .3s cubic-bezier(.4,0,.2,1), color .3s cubic-bezier(.4,0,.2,1)';
   html.setAttribute('data-theme', next);
   try { localStorage.setItem('theme', next); } catch (e) {}
   applyThemeIcon();
 }
 
-document.addEventListener('DOMContentLoaded', applyThemeIcon);
+/* =========================================================
+   ★ 兼容模式切换
+   ========================================================= */
+function applyCompatIcon() {
+  var icon = document.getElementById('compat-icon');
+  if (!icon) return;
+  var isCompat = document.documentElement.classList.contains('compat');
+  icon.textContent = isCompat ? '🔲' : '✨';
+  var btn = document.getElementById('compat-toggle-btn');
+  if (btn) btn.title = isCompat ? '当前：兼容模式（点击切回特效）' : '当前：特效模式（点击切到兼容）';
+}
+
+function toggleCompat() {
+  var html = document.documentElement;
+  var willEnable = !html.classList.contains('compat');
+  if (willEnable) {
+    html.classList.add('compat');
+  } else {
+    html.classList.remove('compat');
+  }
+  try { localStorage.setItem('compat', willEnable ? '1' : '0'); } catch (e) {}
+  applyCompatIcon();
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+  applyThemeIcon();
+  applyCompatIcon();
+});
 
 /* ========================================================= */
 
@@ -1762,7 +2341,7 @@ function NewWorld() {
   });
 }
 
-/* 字段折叠：使用 max-height 过渡，展开/折叠更平滑 */
+/* 字段折叠 */
 function toggleField(key) {
   var body = document.getElementById('ft_body_' + key);
   var btn  = document.getElementById('ft_but_'  + key);
@@ -1774,6 +2353,7 @@ function toggleField(key) {
     body.classList.add('show');
     btn.textContent = '折叠';
     if (box) box.classList.add('expanded');
+    if (window.CookPanel && window.CookPanel.enhanceField) window.CookPanel.enhanceField(key);
   } else {
     body.classList.remove('show');
     btn.textContent = '展开';
@@ -1907,7 +2487,10 @@ function toggleField(key) {
     wrap.appendChild(pre);
   }
 
-  document.querySelectorAll('code.language-cpp').forEach(function (el) {
+  function enhanceBlock(el) {
+    if (el.getAttribute('data-highlighted') === '1') return;
+    el.setAttribute('data-highlighted', '1');
+
     var raw = el.textContent;
     el.innerHTML = highlight(raw);
 
@@ -1920,7 +2503,14 @@ function toggleField(key) {
 
       if (contributorEl) contributorEl.remove();
     }
-  });
+  }
+
+  window.CookPanel = window.CookPanel || {};
+  window.CookPanel.enhanceField = function (key) {
+    var body = document.getElementById('ft_body_' + key);
+    if (!body) return;
+    body.querySelectorAll('code.language-cpp').forEach(enhanceBlock);
+  };
 })();
 
 function ToL() {
