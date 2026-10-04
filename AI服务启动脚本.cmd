@@ -1,0 +1,1 @@
+llama-server.exe -m DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf -c 4096 --host 0.0.0.0 --port 8080 --jinja
