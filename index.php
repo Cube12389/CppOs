@@ -102,6 +102,132 @@ function call_llm($prompt, $base_url, $model, $timeout, $max_tokens) {
 }
 
 /* ============================================================
+ * 模型名归一化（去重 / 匹配）
+ * ============================================================ */
+/**
+ * 生成用于去重和匹配的"规范键"：
+ *   - 反斜杠统一成正斜杠
+ *   - 去目录前缀（只留文件名）
+ *   - 去 .gguf 后缀
+ *   - 转小写
+ */
+function model_canonical_key($id) {
+    $id = (string)$id;
+    if ($id === '') return '';
+    $id = str_replace('\\', '/', $id);
+    $pos = strrpos($id, '/');
+    if ($pos !== false) $id = substr($id, $pos + 1);
+    $id = preg_replace('/\.gguf$/i', '', $id);
+    return strtolower(trim($id));
+}
+
+/**
+ * 生成用于展示的"显示名"：去目录前缀、去 .gguf 后缀。
+ */
+function model_display_name($id) {
+    $id = (string)$id;
+    if ($id === '') return '';
+    $id = str_replace('\\', '/', $id);
+    $pos = strrpos($id, '/');
+    if ($pos !== false) $id = substr($id, $pos + 1);
+    $id = preg_replace('/\.gguf$/i', '', $id);
+    return trim($id);
+}
+
+/**
+ * 从模型显示名里解析参数规模（单位：B，十亿参数）。
+ * 例："Qwen2.5-7B-Instruct" → 7.0；"deepseek-r1-0.5B" → 0.5。
+ * 解析不到返回 -1.0（排序时放到最后）。
+ */
+function model_param_size($id) {
+    $name = model_display_name($id);
+    if ($name === '') return -1.0;
+    if (preg_match('/(?:^|[^0-9A-Za-z.])(\d+(?:\.\d+)?)\s*[Bb](?![0-9A-Za-z])/', $name, $m)) {
+        return (float)$m[1];
+    }
+    return -1.0;
+}
+
+/* ============================================================
+ * ★ 模型体积 / 内存占用估算
+ * ============================================================ */
+
+/**
+ * 从模型名里推测量化等级，返回"每参数占用的字节数"。
+ * 匹配不到时按 Q4_K_M 一类的常见量化（0.60 B/参数）估算。
+ */
+function model_quant_bytes_per_param($name) {
+    $n = strtolower((string)$name);
+    // 顺序很重要：更具体的键必须排在前面（如 iq4 在 q4 之前，bf16 在 f16 之前）
+    $table = [
+        'iq1'  => 0.24,
+        'iq2'  => 0.33,
+        'iq3'  => 0.45,
+        'iq4'  => 0.55,
+        'q2'   => 0.36,
+        'q3'   => 0.48,
+        'q4'   => 0.58,
+        'q5'   => 0.72,
+        'q6'   => 0.85,
+        'q8'   => 1.07,
+        'bf16' => 2.00,
+        'fp16' => 2.00,
+        'f16'  => 2.00,
+        'fp32' => 4.00,
+        'f32'  => 4.00,
+    ];
+    foreach ($table as $k => $v) {
+        if (strpos($n, $k) !== false) return $v;
+    }
+    return 0.60;
+}
+
+/**
+ * 估算模型权重的字节数。
+ * 优先级：
+ *   1) llama.cpp /v1/models 返回的 meta.size（GGUF 文件真实字节数，最准）
+ *   2) meta.n_params × 量化字节数
+ *   3) 从模型名解析出的参数量(B) × 量化字节数
+ * 无法估算时返回 null。
+ */
+function model_weight_bytes($id, $meta = []) {
+    if (is_array($meta) && isset($meta['size']) && is_numeric($meta['size']) && (float)$meta['size'] > 0) {
+        return (float)$meta['size'];
+    }
+    $params = 0.0;
+    if (is_array($meta) && isset($meta['n_params']) && is_numeric($meta['n_params']) && (float)$meta['n_params'] > 0) {
+        $params = (float)$meta['n_params'];
+    }
+    if ($params <= 0) {
+        $b = model_param_size($id);
+        if ($b > 0) $params = $b * 1e9;
+    }
+    if ($params <= 0) return null;
+    $bpp = model_quant_bytes_per_param(model_display_name($id));
+    return $params * $bpp;
+}
+
+/**
+ * 由权重字节数估算"运行占用内存"：
+ *   权重 × 1.2（KV Cache / 计算缓冲）+ 0.4 GiB（进程与运行时开销）
+ */
+function model_memory_bytes($weight_bytes) {
+    if ($weight_bytes === null || !is_numeric($weight_bytes) || $weight_bytes <= 0) return null;
+    return $weight_bytes * 1.2 + 429496730; // 0.4 GiB
+}
+
+/**
+ * 人类可读的字节数格式化：>= 1GiB 用 GB（1 位小数），否则用 MB。
+ */
+function format_bytes_human($bytes) {
+    if ($bytes === null || !is_numeric($bytes) || $bytes <= 0) return '';
+    $gb = $bytes / 1073741824.0;
+    if ($gb >= 1) return rtrim(rtrim(sprintf('%.1f', $gb), '0'), '.') . ' GB';
+    $mb = $bytes / 1048576.0;
+    return rtrim(rtrim(sprintf('%.0f', $mb), '0'), '.') . ' MB';
+}
+
+/* ============================================================
  * 多台 AI 服务器调度
  * ============================================================ */
 function ai_server_probe($base_url, $timeout = 2) {
@@ -118,6 +244,35 @@ function ai_server_probe($base_url, $timeout = 2) {
     curl_close($ch);
     return ($r !== false && $code >= 200 && $code < 400);
 }
+
+/**
+ * 拉取某个节点 /v1/models 并解析出模型 id 列表。失败返回空数组。
+ */
+function ai_server_models($base_url, $timeout = 3) {
+    if ($base_url === '') return [];
+    $ch = curl_init($base_url . '/v1/models');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_CONNECTTIMEOUT => $timeout,
+        CURLOPT_ENCODING       => '',
+    ]);
+    $r    = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($r === false || $code < 200 || $code >= 400) return [];
+    $d = json_decode($r, true);
+    if (!is_array($d) || !isset($d['data']) || !is_array($d['data'])) return [];
+    $out = [];
+    foreach ($d['data'] as $m) {
+        if (is_array($m) && isset($m['id'])) {
+            $id = (string)$m['id'];
+            if ($id !== '') $out[] = $id;
+        }
+    }
+    return $out;
+}
+
 function ai_lock_dir() {
     $d = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'llama_ai_locks';
     if (!is_dir($d)) @mkdir($d, 0777, true);
@@ -142,26 +297,75 @@ function ai_server_base_url($ip, $port = 8080) {
     if (preg_match('#^https?://#i', $ip)) return rtrim($ip, '/');
     return 'http://' . $ip . ':' . $port;
 }
-function pick_ai_server($conn, $port = 8080, $probe_timeout = 2) {
+
+/**
+ * 挑选可用 AI 节点。
+ * $required_model 不为空时，按归一化 key 匹配节点上真实存在的模型，跳过不匹配的节点。
+ * 返回结果中 'use_model' 为节点上真实存在的模型 id（空字符串表示未指定，由上层决定）。
+ */
+function pick_ai_server($conn, $port = 8080, $probe_timeout = 3, $required_model = '') {
     $rows = [];
     $res  = $conn->query("SELECT `uid`, `ip`, `num` FROM `ai_server` ORDER BY `num` ASC, `uid` ASC");
     if ($res) { while ($r = $res->fetch_assoc()) $rows[] = $r; }
     if (empty($rows)) return ['ok' => false, 'empty_table' => true, 'error' => '当前服务繁忙，请稍后尝试。'];
+
+    $required_key = ($required_model !== '') ? model_canonical_key($required_model) : '';
+
+    $any_alive         = false;
+    $model_missing_all = true;
+
     foreach ($rows as $row) {
         $ip = trim((string)$row['ip']);
         if ($ip === '') continue;
         $base_url = ai_server_base_url($ip, $port);
         if ($base_url === '') continue;
+
         $fp = @fopen(ai_lock_path($row['uid'], $row['ip']), 'c');
         if (!$fp) continue;
-        if (!@flock($fp, LOCK_EX | LOCK_NB)) { @fclose($fp); continue; }
-        if (!ai_server_probe($base_url, $probe_timeout)) {
-            @flock($fp, LOCK_UN); @fclose($fp); continue;
+
+        $locked = @flock($fp, LOCK_EX | LOCK_NB);
+
+        $models = ai_server_models($base_url, $probe_timeout);
+        if (empty($models)) {
+            if ($locked) @flock($fp, LOCK_UN);
+            @fclose($fp);
+            continue;
         }
-        return ['ok' => true, 'server' => $row, 'base_url' => $base_url, 'lock_fp' => $fp];
+
+        $any_alive = true;
+
+        // 在节点的原始模型列表里找匹配 required_key 的真实 id
+        $matched_id = '';
+        if ($required_key !== '') {
+            foreach ($models as $mid) {
+                if (model_canonical_key($mid) === $required_key) { $matched_id = $mid; break; }
+            }
+        }
+
+        if ($required_key === '' || $matched_id !== '') {
+            $model_missing_all = false;
+            if ($locked) {
+                return [
+                    'ok'        => true,
+                    'server'    => $row,
+                    'base_url'  => $base_url,
+                    'lock_fp'   => $fp,
+                    'models'    => $models,
+                    'use_model' => $matched_id,
+                ];
+            }
+        }
+
+        if ($locked) @flock($fp, LOCK_UN);
+        @fclose($fp);
+    }
+
+    if ($required_key !== '' && $any_alive && $model_missing_all) {
+        return ['ok' => false, 'error' => '所选模型「' . $required_model . '」在可用节点上未部署，请重新选择。'];
     }
     return ['ok' => false, 'error' => '当前服务繁忙，请稍后尝试。'];
 }
+
 function release_ai_server($fp) {
     if ($fp) { @flock($fp, LOCK_UN); @fclose($fp); }
 }
@@ -170,20 +374,32 @@ function bump_ai_server_num($conn, $uid) {
     $stmt = $conn->prepare("UPDATE `ai_server` SET `num` = COALESCE(`num`, 0) + 1 WHERE `uid` = ?");
     if ($stmt) { $stmt->bind_param("i", $uid); $stmt->execute(); $stmt->close(); }
 }
-function collect_ai_server_status($conn, $port = 8080, $probe_timeout = 2) {
+function collect_ai_server_status($conn, $port = 8080, $probe_timeout = 3) {
     $rows = [];
     $res  = $conn->query("SELECT `uid`, `ip`, `num` FROM `ai_server` ORDER BY `num` ASC, `uid` ASC");
     if ($res) { while ($r = $res->fetch_assoc()) $rows[] = $r; }
     if (empty($rows)) return [];
+
     $results = [];
     $multi   = curl_multi_init();
     $handles = [];
+
     foreach ($rows as $i => $row) {
-        $ip = trim((string)$row['ip']);
+        $ip       = trim((string)$row['ip']);
         $base_url = ai_server_base_url($ip, $port);
-        $busy = ai_lock_is_busy($row['uid'], $row['ip']);
-        $results[$i] = ['uid' => (int)$row['uid'], 'ip' => $row['ip'], 'num' => (int)$row['num'], 'busy' => $busy, 'alive' => false];
-        if (!$busy && $base_url !== '') {
+        $busy     = ai_lock_is_busy($row['uid'], $row['ip']);
+
+        $results[$i] = [
+            'uid'        => (int)$row['uid'],
+            'ip'         => $row['ip'],
+            'num'        => (int)$row['num'],
+            'busy'       => $busy,
+            'alive'      => false,
+            'models'     => [],
+            'model_meta' => [],
+        ];
+
+        if ($base_url !== '') {
             $ch = curl_init($base_url . '/v1/models');
             curl_setopt_array($ch, [
                 CURLOPT_RETURNTRANSFER => true,
@@ -195,24 +411,55 @@ function collect_ai_server_status($conn, $port = 8080, $probe_timeout = 2) {
             $handles[$i] = $ch;
         }
     }
+
     $running = null;
     do {
         curl_multi_exec($multi, $running);
         if ($running) curl_multi_select($multi, 0.2);
     } while ($running > 0);
+
     foreach ($handles as $i => $ch) {
         $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $body = curl_multi_getcontent($ch);
         $results[$i]['alive'] = ($code >= 200 && $code < 400);
+
+        if ($results[$i]['alive'] && is_string($body) && $body !== '') {
+            $d = json_decode($body, true);
+            if (is_array($d) && isset($d['data']) && is_array($d['data'])) {
+                $seen = [];
+                foreach ($d['data'] as $m) {
+                    if (!is_array($m) || !isset($m['id'])) continue;
+                    $mid = (string)$m['id'];
+                    if ($mid === '') continue;
+                    $key = model_canonical_key($mid);
+                    if ($key === '' || isset($seen[$key])) continue;
+                    $seen[$key] = true;
+                    $results[$i]['models'][] = $mid;
+                    // ★ 记录 llama.cpp 提供的 meta（size / n_params 等），用于体积估算
+                    if (isset($m['meta']) && is_array($m['meta'])) {
+                        $results[$i]['model_meta'][$key] = $m['meta'];
+                    }
+                }
+            }
+        }
         curl_multi_remove_handle($multi, $ch);
         curl_close($ch);
     }
     curl_multi_close($multi);
+
     $out = [];
     foreach ($results as $r) {
         if ($r['busy'])      $state = 'busy';
         elseif ($r['alive']) $state = 'ok';
         else                 $state = 'down';
-        $out[] = ['uid' => $r['uid'], 'ip' => $r['ip'], 'num' => $r['num'], 'state' => $state];
+        $out[] = [
+            'uid'        => $r['uid'],
+            'ip'         => $r['ip'],
+            'num'        => $r['num'],
+            'state'      => $state,
+            'models'     => $r['models'],
+            'model_meta' => $r['model_meta'],
+        ];
     }
     return $out;
 }
@@ -220,12 +467,6 @@ function collect_ai_server_status($conn, $port = 8080, $probe_timeout = 2) {
 /* ============================================================
  * SSE 流式输出 + 深度思考分离
  * ============================================================ */
-
-/**
- * ★ 强制把所有 PHP 输出缓冲层全部清空并关闭，
- *   让后续的 echo 一产生就立刻到达客户端。
- *   在 fastcgi/nginx/apache 环境中这是让 SSE 实时生效的关键。
- */
 function sse_kill_all_buffers() {
     @ini_set('zlib.output_compression', '0');
     @ini_set('output_buffering', '0');
@@ -235,29 +476,15 @@ function sse_kill_all_buffers() {
     while (ob_get_level() > 0) { @ob_end_flush(); }
     @ob_implicit_flush(true);
 }
-
-/**
- * 发送一个 SSE 事件。
- */
 function sse_event($arr) {
     echo 'data: ' . json_encode($arr, JSON_UNESCAPED_UNICODE) . "\n\n";
     @flush();
 }
-
-/**
- * ★ 关键修复：发送一个 4KB 的 SSE 注释填充行。
- *   很多 nginx + fastcgi / Apache + mod_proxy_fcgi 场景会有一个 4KB 的
- *   内部初始缓冲区，只有等它填满或请求结束才会把内容发给浏览器。
- *   之前发的 ": stream-start\n\n" 只有 17 字节，不足以突破缓冲区。
- *   改成 4KB 以上的填充，能立刻把响应头发出去，之后每个事件都是小 chunk，
- *   不会再触发缓冲阈值，从而实现真正的“边生成边显示”。
- */
 function sse_prime_4k() {
     $pad = str_repeat('-', 4096);
     echo ': ' . $pad . "\n\n";
     @flush();
 }
-
 function utf8_safe_len($s, $len) {
     $n = strlen($s);
     if ($len >= $n) return $n;
@@ -265,7 +492,6 @@ function utf8_safe_len($s, $len) {
     while ($len > 0 && (ord($s[$len]) & 0xC0) === 0x80) { $len--; }
     return $len;
 }
-
 function think_parser_feed(&$st, $text) {
     $st['buf'] .= $text;
     $out = [];
@@ -316,7 +542,6 @@ function think_parser_feed(&$st, $text) {
     }
     return $out;
 }
-
 function think_parser_flush(&$st) {
     $out = [];
     if ($st['buf'] !== '') {
@@ -325,7 +550,6 @@ function think_parser_flush(&$st) {
     }
     return $out;
 }
-
 function handle_stream_chunk(&$state, $chunk) {
     $state['sse'] .= $chunk;
     while (($pos = strpos($state['sse'], "\n")) !== false) {
@@ -365,7 +589,6 @@ function handle_stream_chunk(&$state, $chunk) {
         }
     }
 }
-
 function stream_llm_chat($prompt, $base_url, $model, $timeout, $max_tokens, $disable_think = false) {
     $payload = [
         'model'       => $model,
@@ -441,6 +664,7 @@ $ai_reply     = '';
 $ai_error     = '';
 $ai_remaining = null;
 $ai_server_status = [];
+$ai_models        = [];
 
 /* ---------------- 1. 用 cookie 自动登录 ---------------- */
 if (!empty($_COOKIE['login_cookie'])) {
@@ -500,6 +724,54 @@ if ($is_logged_in) {
     }
     if ((int)$user_info['alc'] === 1 || (int)$user_info['alc'] === 2) {
         $ai_server_status = collect_ai_server_status($conn);
+        /*
+         * 按归一化 key 聚合模型：
+         *   key => [
+         *       'display' => 显示名,
+         *       'nodes'   => 部署节点数,
+         *       'size'    => 参数量(B)，-1 表示未知,
+         *       'weight'  => 权重字节数（null 表示无法估算）,
+         *       'memory'  => 预估运行内存字节数（null 表示无法估算）,
+         *   ]
+         */
+        foreach ($ai_server_status as $s) {
+            if (empty($s['models'])) continue;
+            $meta_map = (isset($s['model_meta']) && is_array($s['model_meta'])) ? $s['model_meta'] : [];
+            foreach ($s['models'] as $mid) {
+                $key = model_canonical_key($mid);
+                if ($key === '') continue;
+
+                $meta   = isset($meta_map[$key]) ? $meta_map[$key] : [];
+                $weight = model_weight_bytes($mid, $meta);
+                $memory = model_memory_bytes($weight);
+
+                if (!isset($ai_models[$key])) {
+                    $ai_models[$key] = [
+                        'display' => model_display_name($mid),
+                        'nodes'   => 0,
+                        'size'    => model_param_size($mid),
+                        'weight'  => $weight,
+                        'memory'  => $memory,
+                    ];
+                } else if ($ai_models[$key]['weight'] === null && $weight !== null) {
+                    // 某个节点没有 meta，另一个节点有 → 用有信息的那份
+                    $ai_models[$key]['weight'] = $weight;
+                    $ai_models[$key]['memory'] = $memory;
+                }
+                if ($ai_models[$key]['size'] < 0) {
+                    $b = model_param_size($mid);
+                    if ($b > 0) $ai_models[$key]['size'] = $b;
+                }
+                $ai_models[$key]['nodes']++;
+            }
+        }
+        // ★ 按预估运行内存（拿不到就按权重，再拿不到排最后）从小到大排序
+        uasort($ai_models, function ($a, $b) {
+            $ma = ($a['memory'] !== null) ? $a['memory'] : INF;
+            $mb = ($b['memory'] !== null) ? $b['memory'] : INF;
+            if ($ma == $mb) return strcasecmp($a['display'], $b['display']);
+            return ($ma < $mb) ? -1 : 1;
+        });
     }
 }
 
@@ -511,7 +783,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     /* ---------- ★ AI 流式问答 ---------- */
     if ($action === 'ai_chat_stream') {
 
-        /* ★ 强制关闭所有缓冲层 */
         sse_kill_all_buffers();
 
         header('Content-Type: text/event-stream; charset=utf-8');
@@ -521,12 +792,16 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         header('Connection: keep-alive');
         header('Content-Encoding: identity');
 
-        /* ★★★ 4KB 填充，突破 nginx / fastcgi 初始缓冲区 ★★★ */
         sse_prime_4k();
 
         $stream_deny     = '';
         $stream_prompt   = trim($_POST['prompt'] ?? '');
         $stream_is_admin = ($is_logged_in && (int)$user_info['alc'] === 2);
+
+        $stream_model = trim((string)($_POST['model'] ?? ''));
+        if ($stream_model !== '' && !preg_match('/^[^\x00-\x1F\x7F]{1,200}$/u', $stream_model)) {
+            $stream_model = '';
+        }
 
         if (!$is_logged_in) {
             $stream_deny = '请先登录后再使用 AI 助手';
@@ -548,12 +823,13 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
 
         @set_time_limit(0);
 
-        $picked = pick_ai_server($conn);
+        $picked = pick_ai_server($conn, 8080, 3, $stream_model);
         if (!$picked['ok']) {
             if (!empty($picked['empty_table'])) {
-                $base_url   = $LLM_BASE_URL;
-                $lock_fp    = null;
-                $server_uid = null;
+                $base_url    = $LLM_BASE_URL;
+                $lock_fp     = null;
+                $server_uid  = null;
+                $use_model   = ($stream_model !== '') ? $stream_model : $LLM_MODEL;
             } else {
                 sse_event(['type' => 'error', 'message' => $picked['error']]);
                 sse_event(['type' => 'done', 'remaining' => $ai_remaining, 'is_admin' => $stream_is_admin, 'rate_limit' => (int)$ai_config['rate_limit']]);
@@ -563,9 +839,16 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $base_url   = $picked['base_url'];
             $lock_fp    = $picked['lock_fp'];
             $server_uid = (int)$picked['server']['uid'];
+            if (!empty($picked['use_model'])) {
+                $use_model = $picked['use_model'];
+            } else if (!empty($picked['models'])) {
+                $use_model = $picked['models'][0];
+            } else {
+                $use_model = $LLM_MODEL;
+            }
         }
 
-        $r = stream_llm_chat($stream_prompt, $base_url, $LLM_MODEL, $LLM_TIMEOUT, $LLM_MAX_TOKENS, $LLM_DISABLE_THINK);
+        $r = stream_llm_chat($stream_prompt, $base_url, $use_model, $LLM_TIMEOUT, $LLM_MAX_TOKENS, $LLM_DISABLE_THINK);
 
         if ($lock_fp) { release_ai_server($lock_fp); $lock_fp = null; }
 
@@ -862,22 +1145,41 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             if ($prompt === '') {
                 $ai_error = '请输入你要问的问题';
             } else {
+                $chosen_model = trim((string)($_POST['model'] ?? ''));
+                if ($chosen_model !== '' && !preg_match('/^[^\x00-\x1F\x7F]{1,200}$/u', $chosen_model)) {
+                    $chosen_model = '';
+                }
+
                 $is_admin = ((int)$user_info['alc'] === 2);
                 if (!$is_admin && $ai_remaining !== null && $ai_remaining <= 0) {
                     $ai_error = '已达每 ' . (int)$ai_config['window_minutes'] . ' 分钟 ' . (int)$ai_config['rate_limit'] . ' 次上限，请稍后再试';
                 } else {
                     set_time_limit(0);
-                    $picked = pick_ai_server($conn);
+                    $picked = pick_ai_server($conn, 8080, 3, $chosen_model);
                     if (!$picked['ok']) {
-                        if (!empty($picked['empty_table'])) { $base_url = $LLM_BASE_URL; $lock_fp = null; $server_uid = null; }
-                        else { $ai_error = $picked['error']; $base_url = null; }
+                        if (!empty($picked['empty_table'])) {
+                            $base_url   = $LLM_BASE_URL;
+                            $lock_fp    = null;
+                            $server_uid = null;
+                            $use_model  = ($chosen_model !== '') ? $chosen_model : $LLM_MODEL;
+                        } else {
+                            $ai_error = $picked['error'];
+                            $base_url = null;
+                        }
                     } else {
                         $base_url   = $picked['base_url'];
                         $lock_fp    = $picked['lock_fp'];
                         $server_uid = (int)$picked['server']['uid'];
+                        if (!empty($picked['use_model'])) {
+                            $use_model = $picked['use_model'];
+                        } else if (!empty($picked['models'])) {
+                            $use_model = $picked['models'][0];
+                        } else {
+                            $use_model = $LLM_MODEL;
+                        }
                     }
                     if ($base_url !== null) {
-                        $result = call_llm($prompt, $base_url, $LLM_MODEL, $LLM_TIMEOUT, $LLM_MAX_TOKENS);
+                        $result = call_llm($prompt, $base_url, $use_model, $LLM_TIMEOUT, $LLM_MAX_TOKENS);
                         if ($lock_fp) { release_ai_server($lock_fp); $lock_fp = null; }
                         if ($result['ok']) {
                             if ($server_uid !== null) bump_ai_server_num($conn, $server_uid);
@@ -1520,7 +1822,9 @@ if ($is_logged_in) {
             <?php echo (int)($user_info['num'] ?? 0); ?>
           </div>
         </div>
-      </div>
+      </div><br>
+      <button type="button" class="btn-ghost" onclick="NewWorld(); this.innerHTML = 'Now you enter a new world!'">New World?</button>&nbsp;
+      <button type="button" class="btn-ghost" onclick="window.open('web_ftp.php');">网站开源空间</button>
     </div>
   <?php endif; ?>
 
@@ -1540,6 +1844,33 @@ if ($is_logged_in) {
       <form method="POST" id="ai-form" style="margin-top:12px;">
         <input type="hidden" name="action" value="ai_chat">
         <div style="margin-bottom: 12px;">
+          <label for="ai-model">模型</label>
+          <select name="model" id="ai-model" style="min-width:260px;">
+            <option value="">自动（服务端默认 / 节点第一个模型）</option>
+            <?php foreach ($ai_models as $mkey => $minfo): ?>
+              <?php
+                /* ★ 组装括号内的信息：参数量 · 权重大小 · 预估运行内存 · 部署节点数 */
+                $parts = [];
+                if ($minfo['size'] > 0) {
+                    $parts[] = rtrim(rtrim(sprintf('%.2f', $minfo['size']), '0'), '.') . 'B';
+                }
+                if ($minfo['weight'] !== null) {
+                    $parts[] = format_bytes_human($minfo['weight']);
+                }
+                if ($minfo['memory'] !== null) {
+                    $parts[] = '内存≈' . format_bytes_human($minfo['memory']);
+                }
+                $parts[] = (int)$minfo['nodes'] . ' 节点';
+                $opt_text = $minfo['display'] . '（' . implode(' · ', $parts) . '）';
+              ?>
+              <option value="<?php echo htmlspecialchars($minfo['display']); ?>"><?php echo htmlspecialchars($opt_text); ?></option>
+            <?php endforeach; ?>
+          </select>
+          <span class="muted" style="margin-left:8px;">
+            括号内依次为：参数量 · 权重体积 · 预估运行内存（含 KV Cache 与运行时开销，仅供参考）。已按体积从小到大排序。
+          </span>
+        </div>
+        <div style="margin-bottom: 12px;">
           <label>向 AI 提问</label>
           <textarea name="prompt" id="ai-prompt" rows="3" required placeholder="输入你的问题，例如：用 C++ 写一个快速排序"></textarea>
         </div>
@@ -1549,7 +1880,7 @@ if ($is_logged_in) {
           <span class="ai-status" id="ai-status" style="display:none;">
             <span class="ai-dot"></span><span id="ai-status-text">模型正在思考…</span>
           </span>
-          <span class="muted">生成可能需要几十秒到几分钟，请耐心等待</span>
+          <span class="muted">生成可能需要几十秒到几分钟，较大的模型可能需要更长的时间加载才能开始输出，请耐心等待。为了减少等待，请尽量选择轻量模型。</span>
         </div>
       </form>
 
@@ -1609,6 +1940,7 @@ if ($is_logged_in) {
                 <tr>
                   <th style="width:70px; text-align:center;">UID</th>
                   <th>IP / 地址</th>
+                  <th>已部署模型（体积）</th>
                   <th style="text-align:right;">已处理问题</th>
                   <th style="text-align:center; width:100px;">状态</th>
                 </tr>
@@ -1618,6 +1950,27 @@ if ($is_logged_in) {
                   <tr>
                     <td style="text-align:center; font-family: Consolas, Monaco, monospace;"><?php echo (int)$s['uid']; ?></td>
                     <td style="font-family: Consolas, Monaco, monospace;"><?php echo htmlspecialchars($s['ip']); ?></td>
+                    <td style="font-family: Consolas, Monaco, monospace; font-size:12px;">
+                      <?php
+                        if (!empty($s['models'])) {
+                            $disp_names = [];
+                            $meta_map   = (isset($s['model_meta']) && is_array($s['model_meta'])) ? $s['model_meta'] : [];
+                            foreach ($s['models'] as $mid) {
+                                $mk = model_canonical_key($mid);
+                                $mt = isset($meta_map[$mk]) ? $meta_map[$mk] : [];
+                                $wb = model_weight_bytes($mid, $mt);
+                                $nm = htmlspecialchars(model_display_name($mid));
+                                if ($wb !== null) {
+                                    $nm .= '<span class="muted">（' . htmlspecialchars(format_bytes_human($wb)) . '）</span>';
+                                }
+                                $disp_names[] = $nm;
+                            }
+                            echo implode('<br>', $disp_names);
+                        } else {
+                            echo '<span class="muted">—</span>';
+                        }
+                      ?>
+                    </td>
                     <td style="text-align:right; font-family: Consolas, Monaco, monospace; font-weight:600;"><?php echo (int)$s['num']; ?></td>
                     <td style="text-align:center;">
                       <?php if ($s['state'] === 'ok'): ?>
@@ -1666,6 +2019,9 @@ if ($is_logged_in) {
   </div>
   <?php endif; ?>
 
+  <div class='card'>
+    <a href='WeChat'>→ 聊天室</a><br>
+</div>
   <?php
       if ($is_logged_in) {
         if ($user_info['alc'] == 1 || $user_info['alc'] == 2) {
@@ -1920,15 +2276,10 @@ if ($is_logged_in) {
   </div>
   <?php endif; ?>
 
-  <?php if ($is_logged_in && ($user_info['alc'] == 1 || $user_info['alc'] == 2)): ?>
-    <div style="text-align:center; margin: 20px 0;">
-      <button type="button" class="btn-ghost" onclick="NewWorld();">New World?</button>
-    </div>
-  <?php endif; ?>
-
 </div>
 
 <script>
+
 function applyThemeIcon() {
   var icon = document.getElementById('theme-icon');
   if (!icon) return;
@@ -1975,7 +2326,7 @@ function toggleAiServers() {
 }
 
 function NewWorld() {
-  var url = 'url("https://cdn.luogu.com.cn/upload/image_hosting/uds71m1q.png")';
+  var url = 'url("https://cdn.luogu.com.cn/upload/image_hosting/65keec37.webp")';
   [document.documentElement, document.body].forEach(function (el) {
     el.style.backgroundImage      = url;
     el.style.backgroundSize       = 'cover';
@@ -2106,14 +2457,14 @@ function toggleField(key) {
   var answerWrap = document.getElementById('ai-answer-wrap');
   var answerBox  = document.getElementById('ai-answer');
   var quotaEl    = document.getElementById('ai-quota');
+  var modelEl    = document.getElementById('ai-model');
 
   var controller = null;
   var thinkTW = null;
   var gotReasoning = false, gotAnswer = false;
-  var answerRaw = '';          // 累积原始 Markdown
-  var renderPending = false;   // 渲染节流标记
+  var answerRaw = '';
+  var renderPending = false;
 
-  /* ---------- Markdown 渲染 ---------- */
   function escapeHtml(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
@@ -2122,11 +2473,9 @@ function toggleField(key) {
   }
   function renderMarkdown(md) {
     if (!isMarkedReady()) {
-      // 回退：纯文本 + 换行
       return '<pre style="white-space:pre-wrap;word-break:break-word;">' + escapeHtml(md) + '</pre>';
     }
     try {
-      // 如果流式中还有未闭合的 ```，临时给它补上，避免渲染异常
       var fenceCount = (md.match(/```/g) || []).length;
       var text = md;
       if (fenceCount % 2 === 1) text = md + '\n```';
@@ -2135,7 +2484,6 @@ function toggleField(key) {
       return '<pre style="white-space:pre-wrap;word-break:break-word;">' + escapeHtml(md) + '</pre>';
     }
   }
-  /* 节流渲染：requestAnimationFrame 合并同一帧的多次内容更新 */
   function scheduleRender() {
     if (renderPending) return;
     renderPending = true;
@@ -2149,7 +2497,6 @@ function toggleField(key) {
     else setTimeout(cb, 16);
   }
 
-  /* ---------- 思考区打字机 ---------- */
   function makeTypewriter(el, speed, step) {
     el.textContent = '';
     var node = document.createTextNode('');
@@ -2182,6 +2529,7 @@ function toggleField(key) {
   function setBusy(b) {
     submitBtn.disabled = b;
     promptEl.disabled  = b;
+    if (modelEl) modelEl.disabled = b;
     stopBtn.style.display = b ? 'inline-block' : 'none';
     statusEl.style.display = b ? 'inline-flex' : 'none';
   }
@@ -2213,6 +2561,7 @@ function toggleField(key) {
     var body = new URLSearchParams();
     body.append('action', 'ai_chat_stream');
     body.append('prompt', prompt);
+    if (modelEl && modelEl.value) body.append('model', modelEl.value);
 
     fetch(window.location.href, {
       method: 'POST',
@@ -2220,7 +2569,6 @@ function toggleField(key) {
       body: body.toString(),
       credentials: 'same-origin',
       signal: controller.signal,
-      // 关键：让浏览器也不做输入缓冲
       cache: 'no-store'
     }).then(function (res) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -2251,7 +2599,6 @@ function toggleField(key) {
 
   function handleEvent(raw) {
     if (!raw) return;
-    // 跳过 SSE 注释行（以 : 开头且非 data: 的）
     var lines = raw.split('\n');
     var data = '';
     for (var i = 0; i < lines.length; i++) {
@@ -2274,7 +2621,6 @@ function toggleField(key) {
       if (!gotAnswer) { gotAnswer = true; answerWrap.style.display = 'block'; }
       setStatus('正在输出答案…');
       answerRaw += (obj.content || '');
-      // ★ Markdown 增量渲染（rAF 节流），模型吐一个字就跟着渲染
       scheduleRender();
     } else if (obj.type === 'error') {
       showError(obj.message || 'AI 服务错误');
@@ -2291,7 +2637,6 @@ function toggleField(key) {
     setBusy(false);
     controller = null;
     if (thinkTW) thinkTW.finish();
-    // 最后再做一次完整 markdown 渲染（确保无未闭合代码块）
     if (answerBox) {
       answerBox.innerHTML = renderMarkdown(answerRaw);
       answerBox.scrollTop = answerBox.scrollHeight;
